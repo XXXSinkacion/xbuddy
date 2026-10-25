@@ -266,6 +266,8 @@ def test_fact_citing_only_failed_evidence_is_downgraded():
 def test_claim_number_extraction_skips_dates_codes_and_counts():
     nums = [c["raw"] for c in extract_claim_numbers("2026-07-27 至 2026-10-23 共 59 根，600519.SH 报告期 2026-2，MA20 为 1280.97 元，近 90 天上涨 29 日 [E3]")]
     assert nums == ["1280.97元"]
+    # 不带交易所后缀的 6 位证券代码不是度量值（演示视频录制时发现的误报）
+    assert extract_claim_numbers("按代码“600036”检索失败，成交量 5,768,593 股 [E1]") == [{"raw": "5,768,593股", "value": 5768593.0, "decimals": 0, "unit": "股"}]
 
 
 # ------------------------------------------------------------------ 过期数据 / 公开部署保护

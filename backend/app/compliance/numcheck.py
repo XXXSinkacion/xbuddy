@@ -44,8 +44,8 @@ def extract_claim_numbers(text: str) -> list[dict]:
         has_comma = "," in digits
         val = float(digits.replace(",", ""))
         if not (has_dec or has_comma or unit):
-            # 无小数、无单位的整数：只核验“大数”，跳过年份与小计数
-            if val < 1000 or 1900 <= val <= 2100:
+            # 无小数、无单位的整数：只核验“大数”，跳过年份、小计数与不带后缀的 6 位证券代码（如“600036”）
+            if val < 1000 or 1900 <= val <= 2100 or len(digits) == 6:
                 continue
         if unit in ("次",) and not has_dec:
             continue

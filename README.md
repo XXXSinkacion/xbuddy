@@ -138,7 +138,7 @@ cd backend && python -m pytest -q      # 41 个用例，约 30s，全部离线�
 - 长期记忆为关键词打分检索，未做向量检索；记忆内容全部为匿名构造数据。
 - 数值核验只覆盖【事实】要点；【推断】里的派生数值（如两者之差、单季推算）按定义不是原始字段，不做核验，只靠标签提示。核验按绝对值匹配（正负号常由“下降 / 回撤”等文字表达），因此不检查符号写反。
 - 公开实例没有登录与多租户：任何访问者都能看到所有线程、使用故障注入；靠并发上限、每日成本上限与故障自动过期兜底。
-- 未做演示视频（可选项）。
+- 演示视频（可选项）已制作，随提交材料单独提供（约 2 分钟，1080p，无配音、中文字幕）。视频由 `scripts/demo_video/make_demo.py` 全自动录制：无头浏览器按分镜操作真实产品（真实模型 + 扶摇实时数据），截屏流直接编码为 MP4，等待模型的片段 4 倍速并标注；“故障降级”片段为录制前预跑的线程，字幕中已注明。
 
 ## 9. 目录结构
 
@@ -153,7 +153,7 @@ backend/app/
 backend/tests/       41 个用例（主链路 / 审批与停止 / 失败降级 / 检查点恢复 / 单元 / HTTP / 审查修复回归）
 frontend/src/        React 工作台：App、Blocks(动态 UI)、Panels(任务/证据/产物/观测/记忆)、KlineChart、SSE hook
 docs/                DESIGN.md AI_USAGE.md TESTING.md
-Dockerfile docker-compose.yml scripts/
+Dockerfile docker-compose.yml scripts/（live_probe.py 真实接口冒烟；demo_video/ 演示视频自动录制）
 ```
 
 ## 10. 部署
