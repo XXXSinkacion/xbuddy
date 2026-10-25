@@ -1,0 +1,30 @@
+# Render 蓝图（https://render.com/docs/blueprint-spec）
+# 在 Render 控制台 New → Blueprint 选择本仓库即可按此文件创建服务；
+# 密钥类变量 sync: false，表示不写入仓库，需在 Render 控制台手工填写。
+services:
+  - type: web
+    name: xbuddy
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: FUYAO_API_KEY
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_PROVIDER
+        value: openai_compat
+      - key: LLM_BASE_URL
+        value: https://api.deepseek.com/v1
+      - key: LLM_MODEL
+        value: deepseek-chat
+      - key: FUYAO_MODE
+        value: auto
+      - key: DATA_DIR
+        value: /data
+      - key: HARNESS_PLAN_APPROVAL
+        value: auto
+      - key: ENABLE_FAULT_INJECTION
+        value: "true"
