@@ -2,6 +2,7 @@
 两种模式都经过同一条工具管线（策略 → 调用 → 证据 → UI 块 → 检查点）。"""
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Awaitable, Callable, Optional
 
@@ -19,7 +20,8 @@ log = logging.getLogger("xbuddy.executor")
 EXECUTOR_SYSTEM = """你是「投资 X Buddy」的研究执行器，负责完成一个具体研究任务。
 工作方式：
 - 先调用工具取数，再基于返回的证据写任务小结。每条工具返回都带有证据编号 E#，小结中引用数据时必须写明 [E#]。
-- 不确定标的代码时先用 search_ticker；一次只做本任务范围内的事，不要越界。
+- 不确定标的代码时先用 search_ticker；一次只做本任务范围内的事，不要越界。互不依赖的取数可以在同一轮里并行调用多个工具。
+- 只有数据工具返回的 E# 才是证据；note_fact / get_evidence / 记忆工具不产生新证据，引用时写原始 E#。
 - 工具返回“数据缺失 / 失败 / 过期缓存”时，如实写入小结，不得编造数值，不得默认“正常”。
 - 严禁输出涨跌预测、目标价、收益承诺或买入/卖出/加减仓建议；只描述事实与可验证的推断，并用【事实】【推断】【不确定】标注。
 - 小结格式：3~8 条要点，每条带 [E#]；最后一行写“证据：E1, E2, …”。
@@ -122,20 +124,24 @@ class TaskExecutor:
                 nudged = True
                 state.task_consecutive_errors = 0
 
+            # token / 成本 / 时延由 runtime 的统一 emitter 依据 llm.end 事件计入，此处不重复累计
             resp = await self.llm.chat(state.task_messages, tools_schema, purpose=f"task:{task.id}", on_event=self.emit, temperature=0.2, max_tokens=1800)
-            state.usage.llm_calls += 1
-            state.usage.input_tokens += resp.input_tokens
-            state.usage.output_tokens += resp.output_tokens
-            state.usage.cost_usd += resp.cost_usd
-            state.usage.llm_latency_ms += resp.latency_ms
             state.task_steps += 1
             state.step += 1
             state.task_messages.append(resp.to_message())
 
             if not resp.tool_calls:
                 summary = (resp.content or "").strip() or "（模型未给出小结）"
+                status = "done"
+                # 不得静默生成“正常”结论：没有任何成功证据的任务不能标为完成
+                if not state.task_ok_evidence:
+                    status = "partial"
+                    if state.task_call_signatures:
+                        summary += "\n【系统】本任务的数据工具调用均未成功获取数据（失败 / 缺失），上文中的事实性表述缺少证据支撑。"
+                    else:
+                        summary += "\n【系统】本任务未调用任何数据工具，小结没有证据支撑，仅供参考。"
                 self.checkpoint(state)
-                return TaskResult(status="done", summary=summary, evidence_labels=list(state.task_evidence), blocks=list(state.task_blocks))
+                return TaskResult(status=status, summary=summary, evidence_labels=list(state.task_evidence), blocks=list(state.task_blocks))
 
             if resp.content:
                 self.emit("task.note", {"task_id": task.id, "text": resp.content[:400]})
@@ -161,9 +167,13 @@ class TaskExecutor:
         self._after_tools(state)
 
     async def _process_tool_calls(self, task: PlanTask, state: RunState, calls: list[dict]) -> None:
+        """同一轮的自动放行（L0/L1）调用并发执行以降低时延；遇到需审批的调用先把前面的批次执行完再挂起。"""
+        batch: list[dict] = []
         for i, tc in enumerate(calls):
             spec = self.registry.get(tc["name"])
             if self.policy.tool_needs_approval(spec):
+                await self._execute_batch(task, state, batch)
+                batch = []
                 state.pending_tool_call = {**tc, "remaining": calls[i + 1 :], "decision": None}
                 self.checkpoint(state)
                 approval = self.request_approval(
@@ -172,24 +182,44 @@ class TaskExecutor:
                     {"tool": tc["name"], "arguments": tc["arguments"], "risk": spec.risk if spec else "L3", "risk_label": spec.public()["risk_label"] if spec else "", "description": spec.description if spec else "", "task_id": task.id},
                 )
                 raise NeedsApproval(approval)
-            await self._execute_one(task, state, tc)
+            batch.append(tc)
+        await self._execute_batch(task, state, batch)
+
+    async def _execute_batch(self, task: PlanTask, state: RunState, calls: list[dict]) -> None:
+        if not calls:
+            return
+        # 1) 按原顺序做循环拦截（确定性）；2) 可执行的并发调用；3) 按原顺序回填 tool 消息与证据块
+        plan: list[tuple[dict, Optional[tuple[str, dict]]]] = []
+        for tc in calls:
+            name, args = tc["name"], dict(tc.get("arguments") or {})
+            sig = args_signature(name, args)
+            if self.policy.is_loop(state, sig):
+                plan.append((tc, None))
+                continue
+            state.task_call_signatures.append(sig)
+            plan.append((tc, (name, args)))
+        runnable = [p for p in plan if p[1] is not None]
+        ctx = self.make_ctx(task.id, state)
+        if len(runnable) > 1:
+            self.emit("tool.parallel", {"task_id": task.id, "tools": [p[1][0] for p in runnable]})
+        results = await asyncio.gather(*[self.runner.invoke(p[1][0], p[1][1], ctx) for p in runnable])
+        it = iter(results)
+        for tc, call in plan:
+            if call is None:
+                state.task_messages.append({"role": "tool", "tool_call_id": tc["id"], "name": tc["name"], "content": "检测到与之前完全相同的工具调用（重复 ≥2 次），已拦截。请改用不同参数或基于已有证据作结。"})
+                self.emit("tool.loop_blocked", {"tool": tc["name"], "task_id": task.id})
+                state.task_consecutive_errors += 1
+                continue
+            name = call[0]
+            result, ev = next(it)
+            label = ev["label"] if ev else None
+            self._account_tool(state, result, label)
+            state.task_messages.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": render_tool_result(result, label)})
+            if not result.meta.get("no_evidence"):
+                state.task_blocks.extend(blocks_from_result(name, result, label))
 
     async def _execute_one(self, task: PlanTask, state: RunState, tc: dict) -> None:
-        name, args = tc["name"], dict(tc.get("arguments") or {})
-        sig = args_signature(name, args)
-        if self.policy.is_loop(state, sig):
-            state.task_messages.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": "检测到与之前完全相同的工具调用（重复 ≥2 次），已拦截。请改用不同参数或基于已有证据作结。"})
-            self.emit("tool.loop_blocked", {"tool": name, "task_id": task.id})
-            state.task_consecutive_errors += 1
-            return
-        state.task_call_signatures.append(sig)
-        ctx = self.make_ctx(task.id, state)
-        result, ev = await self.runner.invoke(name, args, ctx)
-        label = ev["label"] if ev else None
-        self._account_tool(state, result, label)
-        state.task_messages.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": render_tool_result(result, label)})
-        if not result.meta.get("no_evidence"):
-            state.task_blocks.extend(blocks_from_result(name, result, label))
+        await self._execute_batch(task, state, [tc])
 
     def _after_tools(self, state: RunState) -> None:
         msgs, stats = self.ctx_mgr.compress_if_needed(state.task_messages)
@@ -207,6 +237,8 @@ class TaskExecutor:
             state.usage.tool_cache_hits += 1
         if label:
             state.task_evidence.append(label)
+            if result.ok:
+                state.task_ok_evidence.append(label)
         if result.ok:
             state.task_consecutive_errors = 0
         else:
@@ -284,7 +316,7 @@ class TaskExecutor:
 
     async def _run_pipeline(self, task: PlanTask, state: RunState) -> TaskResult:
         steps = task.pipeline or []
-        notes: list[str] = []
+        notes = state.task_notes  # 持久化在检查点中：中途恢复不会丢掉已完成步骤的小结
         while state.pipeline_index < len(steps):
             await self.gate(state)
             step = steps[state.pipeline_index]

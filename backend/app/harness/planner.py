@@ -142,8 +142,10 @@ class Planner:
         self.llm = llm
         self.registry = registry
 
-    async def plan(self, goal: str, *, memories: list[dict], history: list[dict], on_event: Optional[Callable[[str, dict], None]] = None) -> tuple[Plan, Optional[str]]:
+    async def plan(self, goal: str, *, memories: list[dict], history: list[dict], on_event: Optional[Callable[[str, dict], None]] = None, force_template: bool = False) -> tuple[Plan, Optional[str]]:
         """返回 (计划, 降级原因|None)。"""
+        if force_template:
+            return template_plan(goal, self.registry), None
         if self.llm is None or not self.llm.available:
             return template_plan(goal, self.registry), "模型未配置，使用模板规划"
         user = self._user_prompt(goal, memories, history)

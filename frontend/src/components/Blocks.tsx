@@ -117,7 +117,7 @@ export function ApprovalBlock({ b, live, onDecided }: { b: Block; live?: Approva
           <button className="danger" disabled={busy} onClick={() => decide(false)}>拒绝</button>
         </div>
       ) : (
-        <div className="hint">已{a.status === "approved" ? "批准" : "拒绝"}{a.reason ? `：${a.reason}` : ""} · {fmtTime(a.decided_at)}</div>
+        <div className="hint">{a.status === "approved" ? "已批准" : a.status === "expired" ? "已失效" : "已拒绝"}{a.reason ? `：${a.reason}` : ""} · {fmtTime(a.decided_at)}</div>
       )}
       {err && <div className="callout error">{err}</div>}
     </div>

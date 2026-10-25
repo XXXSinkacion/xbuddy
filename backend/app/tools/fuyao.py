@@ -45,6 +45,18 @@ def fmt_ts(ms: Optional[int]) -> str:
     return datetime.fromtimestamp(ms / 1000, TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def kline_gap(bars: list[dict], end_ms: int, now_ms: Optional[int] = None, max_gap_days: float = 7) -> Optional[str]:
+    """区间末端缺数据（停牌 / 长假 / 数据未更新）时返回说明，避免把旧数据当成“最新”（数据过期不得静默）。"""
+    last = bars[-1].get("date_ms") if bars else None
+    if not last:
+        return None
+    eff_end = min(end_ms, now_ms if now_ms is not None else int(time.time() * 1000))
+    gap_days = (eff_end - last) / 86_400_000
+    if gap_days > max_gap_days:
+        return f"最近一根 K 线为 {fmt_ts(last)[:10]}，距区间末端约 {int(gap_days)} 天无数据（可能停牌、长假休市或数据未更新），不能视为最新行情"
+    return None
+
+
 def split_codes(s: str) -> list[str]:
     out = []
     for part in str(s).replace("，", ",").split(","):
@@ -229,7 +241,8 @@ def register_fuyao_tools(registry: ToolRegistry, backend: FuyaoBackend) -> list[
         bars = body["data"].get("item", [])
         if not bars:
             return ToolResult.missing(f"{code} 在 {args['start_date']}~{args['end_date']} 无 K 线数据", source=src, request_id=body.get("request_id"))
-        return ToolResult(ok=True, data=body["data"] | {"thscode": code, "adjust": adjust}, source=src, data_timestamp=body["data"].get("timestamp"), request_id=body.get("request_id"), unit_notes=f"日线；价格单位元；成交量股；成交额元；复权方式 {adjust}", summary=_kline_summary(code, bars, adjust))
+        gap = kline_gap(bars, end)
+        return ToolResult(ok=True, status="partial" if gap else "ok", data=body["data"] | {"thscode": code, "adjust": adjust}, source=src, data_timestamp=body["data"].get("timestamp"), request_id=body.get("request_id"), unit_notes=f"日线；价格单位元；成交量股；成交额元；复权方式 {adjust}", summary=_kline_summary(code, bars, adjust) + (f"；⚠️ {gap}" if gap else ""))
 
     reg(ToolSpec(name="get_kline", description="获取单只 A 股股票的历史日 K 线（开高低收、量、额），支持前复权/后复权/不复权。一次一个 thscode，区间 ≤10 年。", parameters={"type": "object", "properties": {"thscode": {"type": "string"}, "start_date": {"type": "string", "description": "YYYY-MM-DD"}, "end_date": {"type": "string", "description": "YYYY-MM-DD"}, "adjust": {"type": "string", "enum": ["forward", "backward", "none"], "default": "forward"}}, "required": ["thscode", "start_date", "end_date"]}, handler=get_kline, risk="L1", source="fuyao", cacheable=True, cache_ttl_s=3600, est_cost=2, tags=("prices",)))
 
@@ -240,7 +253,8 @@ def register_fuyao_tools(registry: ToolRegistry, backend: FuyaoBackend) -> list[
         bars = body["data"].get("item", [])
         if not bars:
             return ToolResult.missing(f"指数 {code} 在区间内无 K 线数据", source=src, request_id=body.get("request_id"))
-        return ToolResult(ok=True, data=body["data"] | {"thscode": code}, source=src, data_timestamp=body["data"].get("timestamp"), request_id=body.get("request_id"), unit_notes="指数日线；点位；成交额元；无复权", summary=_kline_summary(code, bars, None))
+        gap = kline_gap(bars, end)
+        return ToolResult(ok=True, status="partial" if gap else "ok", data=body["data"] | {"thscode": code}, source=src, data_timestamp=body["data"].get("timestamp"), request_id=body.get("request_id"), unit_notes="指数日线；点位；成交额元；无复权", summary=_kline_summary(code, bars, None) + (f"；⚠️ {gap}" if gap else ""))
 
     reg(ToolSpec(name="get_index_kline", description="获取单只指数 / 同花顺板块的历史日 K 线（近 5 年内）。", parameters={"type": "object", "properties": {"thscode": {"type": "string"}, "start_date": {"type": "string", "description": "YYYY-MM-DD"}, "end_date": {"type": "string", "description": "YYYY-MM-DD"}}, "required": ["thscode", "start_date", "end_date"]}, handler=get_index_kline, risk="L1", source="fuyao", cacheable=True, cache_ttl_s=3600, est_cost=2, tags=("prices", "index")))
 
@@ -274,7 +288,7 @@ def register_fuyao_tools(registry: ToolRegistry, backend: FuyaoBackend) -> list[
             return ToolResult.missing(f"{code} {report} 无财务指标", source=src, request_id=body.get("request_id"))
         key = {"sale_gross_margin": "毛利率", "sale_net_interest_ratio": "净利率", "index_weighted_avg_roe": "ROE", "assets_debt_ratio": "资产负债率", "operating_income_yoy_growth_ratio": "营收同比", "net_profit_yoy_growth_ratio": "净利润同比", "net_profit_cash_content": "净利润现金含量"}
         parts = [f"{v} {_fmt_num(flat.get(k))}" for k, v in key.items() if flat.get(k) is not None]
-        return ToolResult(ok=True, status="partial" if nulls else "ok", data=data | {"flat": flat}, source=src, data_timestamp=None, request_id=body.get("request_id"), unit_notes="报告期 " + report + "；百分比类指标为百分数值（如 89.12 表示 89.12%），周转率为次，倍数为倍；value 为数据源原始字符串", summary=f"{code} {report} 财务指标：" + "，".join(parts) + (f"；缺失指标 {len(nulls)} 个" if nulls else ""))
+        return ToolResult(ok=True, status="partial" if nulls else "ok", data=data | {"flat": flat, "thscode": code, "report": report}, source=src, data_timestamp=None, request_id=body.get("request_id"), unit_notes="报告期 " + report + "；百分比类指标为百分数值（如 89.12 表示 89.12%），周转率为次，倍数为倍；value 为数据源原始字符串", summary=f"{code} {report} 财务指标：" + "，".join(parts) + (f"；缺失指标 {len(nulls)} 个" if nulls else ""))
 
     reg(ToolSpec(name="get_financial_indicators", description="获取单只 A 股指定报告期的五类财务指标（成长、盈利、偿债、营运、现金流）。report 格式 yyyy-1/2/3/4（1 一季报、2 中报、3 三季报、4 年报）。", parameters={"type": "object", "properties": {"thscode": {"type": "string"}, "report": {"type": "string", "description": "如 2025-2"}}, "required": ["thscode", "report"]}, handler=get_financial_indicators, risk="L0", source="fuyao", cacheable=True, cache_ttl_s=86400, tags=("financials",)))
 

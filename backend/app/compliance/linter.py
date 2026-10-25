@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ..tools.fuyao import fmt_ts
+from .numcheck import NumberBag, evidence_closure, extract_claim_numbers
 
 FORBIDDEN_PATTERNS: list[tuple[str, str]] = [
     (r"必涨|必跌|稳赚|稳赢|保本|无风险|躺赢", "确定性预测/收益承诺"),
@@ -94,6 +95,15 @@ def remove_forbidden(md: str) -> tuple[str, int]:
     return "\n".join(out_lines), removed
 
 
+def sanitize_text(text: str, labels: set[str]) -> tuple[str, dict]:
+    """用于任务小结等聊天输出：移除违规表述、把不存在的证据编号替换为“[引用无效]”。"""
+    out, removed = remove_forbidden(text) if scan_forbidden(text) else (text, 0)
+    bad = sorted({c for c in CITATION_RE.findall(out) if c not in labels})
+    for b in bad:
+        out = out.replace(f"[{b}]", "[引用无效]")
+    return out, {"forbidden_removed": removed, "bad_citations": bad}
+
+
 def _section(md: str, title: str) -> Optional[tuple[int, int]]:
     m = re.search(rf"^##\s*[\d一二三四五六七八九十、.\s]*{re.escape(title)}.*$", md, re.M)
     if not m:
@@ -104,7 +114,18 @@ def _section(md: str, title: str) -> Optional[tuple[int, int]]:
     return start, end
 
 
-def check_citations(md: str, labels: set[str]) -> tuple[str, list[dict]]:
+FAILED_STATUSES = ("error", "missing")
+FAILURE_WORDS = re.compile(r"失败|缺失|不可用|未返回|无数据|未获得|未取得|错误|超时|熔断|code\s*=|为空|未披露")
+FACT_TAG = "【事实】"
+
+
+def check_citations(md: str, labels: set[str], by_label: Optional[dict[str, dict]] = None) -> tuple[str, list[dict]]:
+    """逐条检查「核心结论」要点：
+    - 引用缺失 / 编号不存在 → 标【不确定·无证据引用】；
+    - 【事实】只引用了失败 / 缺失证据（且不是在陈述失败本身）→ 改标【不确定】；
+    - 【事实】引用了过期缓存 → 追加提示；
+    - 【事实】中的数值逐个在所引证据原始字段中核验，找不到的标“待核”。"""
+    by_label = by_label or {}
     viol: list[dict] = []
     sec = _section(md, "核心结论")
     if not sec:
@@ -128,6 +149,25 @@ def check_citations(md: str, labels: set[str]) -> tuple[str, list[dict]]:
             viol.append({"type": "uncited", "text": stripped[:160]})
             if "【不确定】" not in line:
                 line = re.sub(r"^(\s*(?:[-*]|\d+\.)\s+)", r"\1【不确定·无证据引用】", line, count=1)
+            new_lines.append(line)
+            continue
+        good = [c for c in cites if c not in bad]
+        if by_label and FACT_TAG in line:
+            statuses = [by_label[c].get("status") for c in good if c in by_label]
+            if statuses and all(s in FAILED_STATUSES for s in statuses) and not FAILURE_WORDS.search(line):
+                viol.append({"type": "fact_on_failed", "labels": good, "text": stripped[:160]})
+                line = line.replace(FACT_TAG, "【不确定·所引证据为失败/缺失】", 1)
+            elif any(s == "stale" for s in statuses) and "缓存" not in line:
+                viol.append({"type": "stale_cited", "labels": good, "text": stripped[:160]})
+                line = line.rstrip() + "（含过期缓存数据，数值可能滞后）"
+        if by_label and FACT_TAG in line:
+            claims = extract_claim_numbers(line)
+            if claims:
+                bag = NumberBag(evidence_closure(good, by_label))
+                missing = [c["raw"] for c in claims if not bag.verify(c)]
+                viol.append({"type": "numbers", "checked": len(claims), "unverified": missing, "text": stripped[:120]})
+                if missing:
+                    line = line.rstrip() + f" 〔待核数值：{'、'.join(missing[:6])}——未在所引证据原始字段中找到〕"
         new_lines.append(line)
     new_body = "\n".join(new_lines)
     if not LABEL_RE.search(new_body):
@@ -199,15 +239,32 @@ def ensure_sections(md: str, evidence: list[dict]) -> tuple[str, list[str]]:
 
 
 def lint(md: str, evidence: list[dict]) -> LintResult:
+    """evidence 可带 raw（原始 JSON）以启用数值核验；不带 raw 时只核验摘要中的数字。"""
     labels = {e["label"] for e in evidence}
+    by_label = {e["label"]: e for e in evidence}
     violations: list[dict] = []
     forb = scan_forbidden(md)
     violations += forb
     md2, removed = remove_forbidden(md) if forb else (md, 0)
-    md3, cit = check_citations(md2, labels)
-    violations += cit
-    md4, added = ensure_sections(md3, evidence)
+    md3, cit = check_citations(md2, labels, by_label)
+    num_viol = [v for v in cit if v["type"] == "numbers"]
+    violations += [v for v in cit if v["type"] != "numbers" or v["unverified"]]
+    evidence_slim = [{k: v for k, v in e.items() if k != "raw"} for e in evidence]
+    md4, added = ensure_sections(md3, evidence_slim)
     if added:
         violations.append({"type": "sections_added", "sections": added})
-    ok = not any(v["type"] in ("forbidden", "bad_citation") for v in violations)
-    return LintResult(ok=ok, md=md4, violations=violations, stats={"forbidden_removed": removed, "uncited": sum(1 for v in cit if v["type"] == "uncited"), "bad_citations": sum(1 for v in cit if v["type"] == "bad_citation"), "sections_added": added})
+    ok = not any(v["type"] in ("forbidden", "bad_citation", "fact_on_failed") for v in violations)
+    checked = sum(v["checked"] for v in num_viol)
+    unverified = sum(len(v["unverified"]) for v in num_viol)
+    stats = {
+        "forbidden_removed": removed,
+        "uncited": sum(1 for v in cit if v["type"] == "uncited"),
+        "bad_citations": sum(1 for v in cit if v["type"] == "bad_citation"),
+        "fact_on_failed": sum(1 for v in cit if v["type"] == "fact_on_failed"),
+        "stale_cited": sum(1 for v in cit if v["type"] == "stale_cited"),
+        "numbers_checked": checked,
+        "numbers_verified": checked - unverified,
+        "numbers_unverified": unverified,
+        "sections_added": added,
+    }
+    return LintResult(ok=ok, md=md4, violations=violations, stats=stats)

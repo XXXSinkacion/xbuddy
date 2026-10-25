@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from ..db import Database, loads, new_id, now_ms
+from ..db import Database, _tokenize, loads, new_id, now_ms
 
 SEED_MEMORIES = [
     {"kind": "preference", "content": "研究偏好（构造数据）：以基本面与估值对比为主，重视数据口径与时点；不需要任何买卖建议或涨跌预测。", "tags": "preference,style"},
@@ -28,8 +28,25 @@ class MemoryStore:
         self.db.memory_insert(row)
         return row
 
-    def recall(self, query: str, limit: int = 5) -> list[dict]:
-        return self.db.memory_search(query, limit=limit)
+    def recall(self, query: str, limit: int = 5, *, exclude_demo: bool = False) -> list[dict]:
+        """按命中词长度加权打分排序（此前 LIKE 回退按时间排序，“研究”这类高频 2-gram 让召回几乎随机）。
+        偏好类记忆是用户画像，总是带上最多 2 条；exclude_demo 时跳过演示数据运行写入的记忆。"""
+        rows = self.db.fetchall("SELECT * FROM memories ORDER BY created_at DESC LIMIT 500")
+        if exclude_demo:
+            rows = [r for r in rows if "demo" not in (r.get("tags") or "").split(",")]
+        terms = [t for t in _tokenize(query or "") if len(t) >= 2]
+        if not terms:
+            return rows[:limit]
+        scored = []
+        for r in rows:
+            hay = f"{r['content']} {r.get('tags') or ''}"
+            score = sum(len(t) * (3 if "." in t or t.isdigit() else 1) for t in terms if t.lower() in hay.lower())
+            if score > 0:
+                scored.append((score, r["created_at"], r))
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        out = [r for _, _, r in scored[:limit]]
+        prefs = [r for r in rows if r["kind"] == "preference" and r not in out][: max(0, 2 - sum(1 for r in out if r["kind"] == "preference"))]
+        return (out + prefs)[: limit + len(prefs)]
 
     def list(self, limit: int = 200) -> list[dict]:
         return self.db.fetchall("SELECT * FROM memories ORDER BY created_at DESC LIMIT ?", [limit])

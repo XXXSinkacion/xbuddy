@@ -73,6 +73,8 @@ class AppState:
             "tools": [t.public() for t in self.registry.specs()],
             "budget_defaults": self.harness.default_budget().model_dump(),
             "fault_injection": s.enable_fault_injection,
+            "fault_ttl_s": s.fault_ttl_s,
+            "guards": {"max_concurrent_runs": s.max_concurrent_runs, "daily_llm_cost_cap_usd": s.daily_llm_cost_cap_usd, "llm_cost_today_usd": round(self.harness.llm_cost_today(), 4)},
             "faults": self.faults.state(),
             "breaker": self.harness.breaker.state(),
         }
@@ -87,7 +89,7 @@ def build_app_state(settings: Optional[Settings] = None, *, db_path: Optional[st
     data_dir = settings.data_path
     db = Database(db_path or data_dir / "xbuddy.sqlite")
     bus = EventBus(db, log_dir=data_dir / "logs")
-    faults = FaultInjector(enabled=settings.enable_fault_injection)
+    faults = FaultInjector(enabled=settings.enable_fault_injection, ttl_s=settings.fault_ttl_s or None)
     registry, fuyao = build_registry(settings)
     llm = build_llm_router(settings, faults)
     harness = Harness(db=db, bus=bus, registry=registry, llm=llm, settings=settings, faults=faults)

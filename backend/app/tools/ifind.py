@@ -82,7 +82,7 @@ def _make_handler(url: str, authorization: Optional[str], transport: str, tool_n
             async with _session(url, _headers(authorization), transport) as session:
                 result = await session.call_tool(tool_name, args or {})
         except Exception as e:  # noqa: BLE001
-            raise ToolError(f"iFinD MCP 调用失败：{type(e).__name__}: {e}", retryable=True) from e
+            raise ToolError(f"iFinD MCP 调用失败：{type(e).__name__}: {e}", retryable=True, transport=True) from e
         texts: list[str] = []
         for c in result.content or []:
             txt = getattr(c, "text", None)

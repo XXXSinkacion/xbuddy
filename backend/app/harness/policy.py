@@ -8,6 +8,15 @@ from ..models import Budget, Plan, RunState
 from ..tools.registry import AUTO_RISK, ToolRegistry, ToolSpec
 
 
+def active_seconds(state: RunState, now_ms: Optional[float] = None) -> float:
+    """运行的有效时长：墙钟时间减去等待审批 / 中断的暂停时间。"""
+    if not state.started_at:
+        return 0.0
+    now = now_ms if now_ms is not None else time.time() * 1000
+    paused = state.paused_ms + ((now - state.paused_at) if state.paused_at else 0)
+    return max(0.0, (now - state.started_at - paused) / 1000)
+
+
 class Policy:
     def __init__(self, budget: Budget):
         self.budget = budget
@@ -48,8 +57,8 @@ class Policy:
             return f"达到工具调用上限 {b.max_tool_calls}"
         if u.cost_usd >= b.max_cost_usd:
             return f"达到成本上限 ${b.max_cost_usd:.2f}"
-        if state.started_at and (time.time() * 1000 - state.started_at) / 1000 >= b.max_duration_s:
-            return f"达到时长上限 {b.max_duration_s}s"
+        if state.started_at and active_seconds(state) >= b.max_duration_s:
+            return f"达到时长上限 {b.max_duration_s}s（不含等待审批时间）"
         return None
 
     def budget_warning(self, state: RunState) -> Optional[str]:
@@ -60,6 +69,8 @@ class Policy:
             return f"成本已达预算 80%（${u.cost_usd:.3f} / ${b.max_cost_usd:.2f}）"
         if u.tool_calls >= 0.8 * b.max_tool_calls:
             return f"工具调用已达预算 80%（{u.tool_calls} / {b.max_tool_calls}）"
+        if u.llm_calls >= 0.8 * b.max_llm_steps:
+            return f"模型调用已达预算 80%（{u.llm_calls} / {b.max_llm_steps}）"
         return None
 
     def task_step_exceeded(self, state: RunState) -> bool:
@@ -74,7 +85,7 @@ class Policy:
 
     def remaining(self, state: RunState) -> dict:
         b, u = self.budget, state.usage
-        elapsed = (time.time() * 1000 - state.started_at) / 1000 if state.started_at else 0
+        elapsed = active_seconds(state)
         return {
             "llm_steps": {"used": u.llm_calls, "max": b.max_llm_steps},
             "tool_calls": {"used": u.tool_calls, "max": b.max_tool_calls},

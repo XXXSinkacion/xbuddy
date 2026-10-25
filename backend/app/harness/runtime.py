@@ -8,7 +8,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Optional
 
-from ..compliance.linter import LintResult
+from ..compliance.linter import LintResult, sanitize_text
 from ..config import Settings
 from ..db import Database, dumps, loads, new_id, now_ms
 from ..events import EventBus
@@ -27,6 +27,10 @@ from .synthesizer import Synthesizer, propose_memories
 log = logging.getLogger("xbuddy.harness")
 
 ACTIVE_STATUSES = ("planning", "running")
+
+
+class CapacityError(ValueError):
+    """全局并发运行数已满（公开部署保护）。"""
 
 
 class Harness:
@@ -141,13 +145,32 @@ class Harness:
         return out
 
     # ----------------------------------------------------------- 运行生命周期
+    def llm_cost_today(self) -> float:
+        """今日（Asia/Shanghai）全部运行的模型成本，取自各运行最近检查点的 usage。"""
+        from datetime import datetime, timedelta, timezone
+
+        tz = timezone(timedelta(hours=8))
+        start = int(datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+        total = 0.0
+        for r in self.db.fetchall("SELECT usage_json FROM runs WHERE created_at >= ?", [start]):
+            total += float((loads(r.get("usage_json"), {}) or {}).get("cost_usd") or 0.0)
+        return total
+
     async def start_run(self, thread_id: str, goal: str, overrides: Optional[dict] = None) -> dict:
         thread = self.db.get("threads", thread_id)
         if not thread:
             raise ValueError("线程不存在")
+        s = self.settings
+        active = (self.db.fetchone("SELECT COUNT(*) AS c FROM runs WHERE status IN ('planning','running')") or {}).get("c", 0)
+        if s.max_concurrent_runs and active >= s.max_concurrent_runs:
+            raise CapacityError(f"当前已有 {active} 个运行在进行（上限 {s.max_concurrent_runs}），请稍后再试")
         budget = self.default_budget().model_copy(update={k: v for k, v in (overrides or {}).items() if k in Budget.model_fields})
         mode = "llm" if (self.llm and self.llm.available) else "template"
-        state = RunState(phase="plan", mode=mode, started_at=now_ms())
+        degrade_reasons: list[str] = []
+        if mode == "llm" and s.daily_llm_cost_cap_usd and self.llm_cost_today() >= s.daily_llm_cost_cap_usd:
+            mode = "template"
+            degrade_reasons.append(f"今日模型成本已达上限 ${s.daily_llm_cost_cap_usd:.2f}（公开演示保护），本次以模板模式运行")
+        state = RunState(phase="plan", mode=mode, started_at=now_ms(), degrade_reasons=degrade_reasons)
         run = {
             "id": new_id("run"),
             "thread_id": thread_id,
@@ -166,7 +189,9 @@ class Harness:
             self.db.update("threads", thread_id, {"title": goal.strip()[:40]})
         self.add_message(thread_id, run["id"], "user", [{"type": "text", "text": goal.strip()}])
         self._emit(run, "run.created", {"goal": goal, "mode": mode, "budget": budget.model_dump()})
-        if mode == "template":
+        if degrade_reasons:
+            self._emit(run, "run.degraded", {"reason": degrade_reasons[0]})
+        elif mode == "template":
             self._emit(run, "run.degraded", {"reason": "未配置可用模型：以模板模式运行（规则规划 + 确定性报告）"})
         self._spawn(run["id"])
         return self._public_run(run)
@@ -195,21 +220,46 @@ class Harness:
         run = self.db.get("runs", run_id)
         if not run:
             raise ValueError("运行不存在")
-        if run["status"] in ("completed", "failed"):
-            raise ValueError(f"运行已{run['status']}，无法恢复")
+        # 只有“未结束”的运行可恢复：中断 / 失败 / 审批已决定后的等待态。
+        # 已完成或已停止的运行已经产出（部分）报告、phase=done，恢复只会让它卡在 running。
+        if run["phase"] == "done" or run["status"] in ("completed", "stopped"):
+            raise ValueError(f"运行已结束（{run['status']}），无法恢复；可在同一线程发起新的研究，历史会作为上下文")
+        t = self._tasks.get(run_id)
+        if t and not t.done():
+            raise ValueError("运行正在进行中")
         pending = self.db.fetchone("SELECT id FROM approvals WHERE run_id = ? AND status = 'pending' AND kind != 'memory_write'", [run_id])
         if pending:
             raise ValueError("仍有待处理的审批，请先决定")
         self._stop_flags.discard(run_id)
-        self.db.update("runs", run_id, {"status": "running", "updated_at": now_ms(), "stop_reason": None})
-        self._emit(run, "run.resumed", {"from_status": run["status"], "phase": run["phase"]})
+        state = self._load_state(run)
+        if state.paused_at:
+            state.paused_ms += max(0, now_ms() - state.paused_at)
+            state.paused_at = None
+        self.db.update("runs", run_id, {"status": "running", "updated_at": now_ms(), "stop_reason": None, "error": None, "finished_at": None, "state_json": dumps(state.model_dump())})
+        self._emit(run, "run.resumed", {"from_status": run["status"], "phase": run["phase"], "paused_ms": state.paused_ms})
         self._spawn(run_id)
         return self.get_run(run_id) or {}
+
+    def _mark_paused(self, run_id: str) -> None:
+        """进入等待审批 / 中断 / 失败：记录暂停起点，恢复时扣除这段时间（不计入时长预算）。"""
+        row = self.db.get("runs", run_id)
+        if not row:
+            return
+        state = self._load_state(row)
+        if not state.paused_at:
+            state.paused_at = now_ms()
+            self.db.update("runs", run_id, {"state_json": dumps(state.model_dump())})
+
+    def _expire_pending_approvals(self, run: dict, reason: str) -> None:
+        for a in self.db.fetchall("SELECT * FROM approvals WHERE run_id = ? AND status = 'pending' AND kind != 'memory_write'", [run["id"]]):
+            self.db.update("approvals", a["id"], {"status": "expired", "reason": reason, "decided_at": now_ms()})
+            self._emit(run, "approval.expired", {"id": a["id"], "kind": a["kind"], "reason": reason})
 
     def recover_on_startup(self) -> int:
         rows = self.db.fetchall("SELECT * FROM runs WHERE status IN ('planning','running')")
         for r in rows:
             self.db.update("runs", r["id"], {"status": "interrupted", "updated_at": now_ms(), "stop_reason": "进程重启，运行被中断；可从检查点恢复"})
+            self._mark_paused(r["id"])
             self._emit(r, "run.interrupted", {"reason": "进程重启", "phase": r["phase"]})
         return len(rows)
 
@@ -222,6 +272,7 @@ class Harness:
             await self._execute(run)
         except NeedsApproval as na:
             self.db.update("runs", run_id, {"status": "waiting_approval", "updated_at": now_ms()})
+            self._mark_paused(run_id)
             self._emit(run, "run.waiting_approval", {"approval": na.approval})
         except StopRun as sr:
             await self._finalize_stopped(self.db.get("runs", run_id) or run, sr.reason, status=sr.status)
@@ -230,6 +281,7 @@ class Harness:
         except Exception as e:  # noqa: BLE001
             log.exception("run %s crashed", run_id)
             self.db.update("runs", run_id, {"status": "failed", "error": f"{type(e).__name__}: {e}", "updated_at": now_ms(), "finished_at": now_ms()})
+            self._mark_paused(run_id)
             self._emit(run, "run.failed", {"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[-1500:]})
             self.add_message(run["thread_id"], run_id, "assistant", [{"type": "callout", "level": "error", "text": f"运行失败：{type(e).__name__}: {e}。可点击「恢复」从最近检查点重试。"}])
         finally:
@@ -239,7 +291,6 @@ class Harness:
         return RunState(**loads(run.get("state_json"), {}))
 
     def checkpoint(self, run: dict, state: RunState, *, note: str = "") -> None:
-        state.step += 0
         self.db.update("runs", run["id"], {"state_json": dumps(state.model_dump()), "usage_json": dumps(state.usage.model_dump()), "phase": state.phase, "mode": state.mode, "updated_at": now_ms()})
         self.db.insert("checkpoints", {"run_id": run["id"], "step": state.step, "state_json": dumps(state.model_dump()), "created_at": now_ms()})
         self._emit(run, "run.checkpoint", {"step": state.step, "phase": state.phase, "task_id": state.current_task_id, "usage": state.usage.model_dump(), "note": note})
@@ -251,6 +302,24 @@ class Harness:
         self._emit(run, "approval.requested", pub)
         self.add_message(run["thread_id"], run["id"], "assistant", [{"type": "approval", "approval": pub}])
         return pub
+
+    def _emitter(self, run: dict, state: RunState):
+        """统一的事件出口：所有模型调用（规划 / 执行 / 报告 / 合规重写）的 token、成本、时延、失败都在这里计入 state.usage，
+        预算停止规则因此覆盖全链路（此前规划与报告阶段的模型成本、llm_errors 未计入）。"""
+
+        def emit(type_: str, payload: dict) -> None:
+            u = state.usage
+            if type_ == "llm.end":
+                u.llm_calls += 1
+                u.input_tokens += int(payload.get("input_tokens") or 0)
+                u.output_tokens += int(payload.get("output_tokens") or 0)
+                u.cost_usd += float(payload.get("cost_usd") or 0.0)
+                u.llm_latency_ms += int(payload.get("latency_ms") or 0)
+            elif type_ == "llm.error":
+                u.llm_errors += 1
+            self._emit(run, type_, payload)
+
+        return emit
 
     def _make_ctx(self, run: dict, task_id: Optional[str], state: RunState) -> ToolContext:
         return ToolContext(run_id=run["id"], task_id=task_id, settings=self.settings, evidence=self.evidence, emit=lambda t, p: self._emit(run, t, p), working_memory=state.working_memory, cache=self.cache, breaker=self.breaker, faults=self.faults, registry=self.registry, memory=self.memory, thread_id=run["thread_id"])
@@ -276,13 +345,14 @@ class Harness:
                 approval = self._request_approval(run, "budget", "预算即将用尽，是否继续？", {"warning": warn, "usage": st.usage.model_dump(), "budget": budget.model_dump(), "proposal": "批准后预算上限提高到当前的 2 倍；拒绝则停止并输出部分报告。"}, task_id=st.current_task_id)
                 raise NeedsApproval(approval)
 
+        emit = self._emitter(run, state)
         executor = TaskExecutor(
             llm=self.llm,
             registry=self.registry,
             runner=self.runner,
             policy=policy,
             ctx_mgr=ContextManager(budget.context_budget_tokens),
-            emit=lambda t, p: self._emit(run, t, p),
+            emit=emit,
             make_ctx=lambda task_id, st: self._make_ctx(run, task_id, st),
             gate=gate,
             request_approval=lambda kind, title, payload: self._request_approval(run, kind, title, payload, task_id=state.current_task_id),
@@ -292,22 +362,23 @@ class Harness:
         while True:
             await gate(state)
             if state.phase == "plan":
-                await self._phase_plan(run, state, policy)
+                await self._phase_plan(run, state, policy, emit)
             elif state.phase == "execute":
                 await self._phase_execute(run, state, executor)
             elif state.phase == "synthesize":
-                await self._phase_synthesize(run, state, status="completed")
+                await self._phase_synthesize(run, state, status="completed", emit=emit)
             else:
                 return
 
     # -------------------------------------------------------------- 阶段
-    async def _phase_plan(self, run: dict, state: RunState, policy: Policy) -> None:
+    async def _phase_plan(self, run: dict, state: RunState, policy: Policy, emit) -> None:
         goal = run["goal"]
-        memories = self.memory.recall(goal, limit=5)
+        # live 模式下不召回演示数据运行写入的记忆，避免把 fixture 数值当作真实先验
+        memories = self.memory.recall(goal, limit=5, exclude_demo=self.settings.fuyao_effective_mode == "live")
         history = self.memory.thread_history(run["thread_id"], exclude_run_id=run["id"])
         self._emit(run, "memory.recalled", {"count": len(memories), "items": [{"kind": m["kind"], "content": m["content"][:120]} for m in memories], "thread_history": len(history)})
         t0 = time.time()
-        plan, degrade = await self.planner.plan(goal, memories=memories, history=history, on_event=lambda t, p: self._emit(run, t, p))
+        plan, degrade = await self.planner.plan(goal, memories=memories, history=history, on_event=emit, force_template=state.mode == "template")
         if degrade:
             state.mode = "template"
             state.degrade_reasons.append(degrade)
@@ -365,6 +436,7 @@ class Harness:
             state.current_task_id = trow["id"]
             state.task_messages, state.task_steps, state.task_consecutive_errors = [], 0, 0
             state.task_call_signatures, state.task_evidence, state.task_blocks = [], [], []
+            state.task_ok_evidence, state.task_notes = [], []
             state.pipeline_index, state.pending_tool_call = 0, None
             self.db.update("tasks", trow["id"], {"status": "running", "started_at": now_ms()})
             self._emit(run, "task.start", {"task_id": trow["id"], "title": task.title, "idx": trow["idx"], "mode": state.mode})
@@ -373,6 +445,11 @@ class Harness:
         except StopRun:
             self.db.update("tasks", trow["id"], {"status": "failed", "error": "运行停止", "ended_at": now_ms()})
             raise
+        # 任务小结同样是产品输出：过一遍合规（违规表述移除、无效证据编号标注），与最终报告同一标准
+        clean, lint_stats = sanitize_text(result.summary, self.evidence.labels(run["id"]))
+        if clean != result.summary:
+            result.summary = clean
+            self._emit(run, "compliance.task_lint", {"task_id": trow["id"], **lint_stats})
         self.db.update("tasks", trow["id"], {"status": result.status, "result_json": dumps(result.model_dump()), "ended_at": now_ms()})
         state.task_summaries.append({"task_id": trow["id"], "title": task.title, "status": result.status, "summary": result.summary, "evidence": result.evidence_labels})
         state.working_memory[f"task_{short_id}_evidence"] = result.evidence_labels
@@ -383,17 +460,16 @@ class Harness:
         self.add_message(run["thread_id"], run["id"], "assistant", blocks)
         state.current_task_id = None
         state.task_messages, state.task_blocks, state.task_evidence, state.pending_tool_call = [], [], [], None
+        state.task_ok_evidence, state.task_notes = [], []
         state.step += 1
         self.checkpoint(run, state, note=f"task {short_id} {result.status}")
 
-    async def _phase_synthesize(self, run: dict, state: RunState, *, status: str, status_note: str = "") -> None:
-        evidence = self.evidence.list(run["id"])
+    async def _phase_synthesize(self, run: dict, state: RunState, *, status: str, status_note: str = "", emit=None) -> None:
+        emit = emit or self._emitter(run, state)
+        evidence = self.evidence.list(run["id"], with_raw=True)  # 原始数据用于 Linter 的数值核验
         plan = Plan(title=state.working_memory.get("plan_title") or run["goal"][:40], tasks=[], mode=state.mode)
         force_template = status != "completed" or state.mode == "template"
-        md, lint_res, gen_mode = await self.synthesizer.write(goal=run["goal"], plan=plan, task_summaries=state.task_summaries, evidence=evidence, run_meta={"status_note": status_note, "mode_note": "；".join(state.degrade_reasons) or "模型未配置"}, on_event=lambda t, p: self._emit(run, t, p), force_template=force_template)
-        if gen_mode == "llm":
-            # 成本已在 on_event 之外；此处从事件无法取回，所以在 router 层记录到 state：简化为按最近 llm.end 事件累计
-            pass
+        md, lint_res, gen_mode = await self.synthesizer.write(goal=run["goal"], plan=plan, task_summaries=state.task_summaries, evidence=evidence, run_meta={"status_note": status_note, "mode_note": "；".join(state.degrade_reasons) or "模型未配置"}, on_event=emit, force_template=force_template)
         art = {"id": new_id("art"), "run_id": run["id"], "thread_id": run["thread_id"], "type": "report", "title": f"研究报告：{plan.title}", "content_md": md, "blocks_json": dumps([]), "lint_json": dumps(lint_res.public()), "version": 1, "created_at": now_ms()}
         self.db.insert("artifacts", art)
         self._emit(run, "artifact.created", {"id": art["id"], "title": art["title"], "type": "report", "lint": lint_res.public(), "gen_mode": gen_mode, "chars": len(md)})
@@ -407,12 +483,20 @@ class Harness:
             {"type": "artifact_ref", "artifact_id": art["id"], "title": art["title"], "gen_mode": gen_mode, "lint": lint_res.public()},
             {"type": "text", "text": _excerpt(md)},
         ]
-        if not lint_res.ok or lint_res.stats.get("forbidden_removed"):
-            blocks.append({"type": "callout", "level": "warning", "text": f"合规检查：移除 {lint_res.stats.get('forbidden_removed', 0)} 处违规表述，{lint_res.stats.get('uncited', 0)} 条结论无引用已标为不确定。"})
+        st_ = lint_res.stats
+        if not lint_res.ok or st_.get("forbidden_removed") or st_.get("uncited") or st_.get("fact_on_failed") or st_.get("numbers_unverified"):
+            parts = [f"移除 {st_.get('forbidden_removed', 0)} 处违规表述", f"{st_.get('uncited', 0)} 条结论无引用已标为不确定"]
+            if st_.get("fact_on_failed"):
+                parts.append(f"{st_['fact_on_failed']} 条“事实”仅引用了失败证据，已改标为不确定")
+            if st_.get("numbers_checked"):
+                parts.append(f"数值核验 {st_.get('numbers_verified', 0)}/{st_['numbers_checked']} 个能在所引证据原始字段中找到，其余已标“待核”")
+            blocks.append({"type": "callout", "level": "warning", "text": "合规检查：" + "；".join(parts) + "。"})
+        elif st_.get("numbers_checked"):
+            blocks.append({"type": "callout", "level": "info", "text": f"数值核验：核心结论中的 {st_['numbers_checked']} 个数值全部能在所引证据的原始字段中找到。"})
         self.add_message(run["thread_id"], run["id"], "assistant", blocks)
         self._emit(run, "run.completed" if status == "completed" else "run.stopped", {"status": status, "usage": state.usage.model_dump(), "artifact_id": art["id"], "reason": status_note})
         # 记忆写入提案（需审批）
-        proposals = propose_memories(run["goal"], md, evidence, run["id"])
+        proposals = propose_memories(run["goal"], md, [{k: v for k, v in e.items() if k != "raw"} for e in evidence], run["id"])
         if proposals:
             budget = Budget(**loads(run.get("budget_json"), {}))
             if budget.memory_write_approval:
@@ -425,6 +509,7 @@ class Harness:
     async def _finalize_stopped(self, run: dict, reason: str, *, status: str = "stopped") -> None:
         state = self._load_state(run)
         self._emit(run, "run.stopping", {"reason": reason})
+        self._expire_pending_approvals(run, f"运行已结束：{reason}")
         # 当前任务标记失败
         if state.current_task_id:
             self.db.update("tasks", state.current_task_id, {"status": "failed", "error": reason, "ended_at": now_ms()})
@@ -447,6 +532,10 @@ class Harness:
         run = self.db.get("runs", a["run_id"])
         if not run:
             raise ValueError("运行不存在")
+        if a["kind"] in ("plan", "tool", "budget") and run["status"] != "waiting_approval":
+            # 运行已被停止 / 已结束：迟到的审批不能把它“复活”
+            self.db.update("approvals", approval_id, {"status": "expired", "reason": f"运行状态为 {run['status']}，审批已失效", "decided_at": now_ms()})
+            raise ValueError(f"运行当前为 {run['status']}，该审批已失效")
         self.db.update("approvals", approval_id, {"status": "approved" if approved else "rejected", "reason": reason, "decided_at": now_ms()})
         pub = self._public_approval(self.db.get("approvals", approval_id) or a)
         self._emit(run, "approval.decided", pub)

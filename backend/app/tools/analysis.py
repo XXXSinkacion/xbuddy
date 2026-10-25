@@ -114,14 +114,14 @@ def register_analysis_tools(registry: ToolRegistry) -> list[str]:
         trimmed = raw
         if isinstance(raw, dict) and isinstance(raw.get("item"), list) and len(raw["item"]) > 200:
             trimmed = raw | {"item": raw["item"][:200], "_truncated": True}
-        return ToolResult(ok=True, data=trimmed, source="local", data_timestamp=ev.get("data_timestamp"), unit_notes=ev.get("unit_notes") or "", summary=f"返回证据 {ev['label']}（{ev['tool']}）的原始数据", meta={"no_evidence": True})
+        return ToolResult(ok=True, status=ev.get("status") or "ok", data=trimmed, source=ev.get("source") or "local", data_timestamp=ev.get("data_timestamp"), unit_notes=ev.get("unit_notes") or "", summary=f"返回证据 {ev['label']}（{ev['tool']}，状态 {ev.get('status')}）的原始数据；引用时请写原编号 [{ev['label']}]", meta={"no_evidence": True, "ref_label": ev["label"]})
 
     reg(ToolSpec(name="get_evidence", description="按编号取回某条证据的原始数据（渐进披露：上下文中只保留摘要时用它取全文）。", parameters={"type": "object", "properties": {"evidence_label": {"type": "string"}}, "required": ["evidence_label"]}, handler=get_evidence, risk="L0", source="local", tags=("context",)))
 
     async def note_fact(args: dict, ctx: ToolContext) -> ToolResult:
         key = str(args["key"]).strip()
         ctx.working_memory[key] = args.get("value")
-        return ToolResult(ok=True, data={"key": key, "value": args.get("value")}, source="local", summary=f"已记入工作记忆：{key} = {str(args.get('value'))[:80]}", meta={"no_evidence": True})
+        return ToolResult(ok=True, data={"key": key, "value": args.get("value")}, source="local", summary=f"已记入工作记忆：{key} = {str(args.get('value'))[:80]}（工作记忆是模型笔记，不是证据，不能作为 [E#] 引用）", meta={"no_evidence": True})
 
     reg(ToolSpec(name="note_fact", description="把一个关键事实写入本次运行的工作记忆（供后续任务复用，如已确认的 thscode、报告期）。", parameters={"type": "object", "properties": {"key": {"type": "string"}, "value": {"type": "string"}}, "required": ["key", "value"]}, handler=note_fact, risk="L0", source="local", tags=("context",)))
 

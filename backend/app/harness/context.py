@@ -50,8 +50,9 @@ def _preview_items(items: list[Any], max_rows: int) -> str:
 
 
 def render_tool_result(result: ToolResult, label: Optional[str], *, max_rows: int = 12, max_chars: int = 2500) -> str:
+    ref = result.meta.get("ref_label") if result.meta else None
     head = [
-        f"证据编号: {label or '-'}",
+        f"证据编号: {label}" if label else (f"证据编号: -（本次为取回原证据 {ref}，引用请写 [{ref}]）" if ref else "证据编号: -（非数据工具，不生成证据，不可作为 [E#] 引用）"),
         f"状态: {result.status}{'' if result.ok else '（失败）'}",
         f"来源: {result.source}",
         f"数据时点: {fmt_ts(result.data_timestamp) if result.data_timestamp else '未提供'}",
@@ -105,6 +106,10 @@ def _groups(body: list[dict]) -> list[list[dict]]:
     return groups
 
 
+FOLD_HEADER = "【已压缩的早期观察摘要】"
+MAX_FOLD_LINES = 80
+
+
 class ContextManager:
     def __init__(self, budget_tokens: int = 24000, keep_last_groups: int = 2, head_messages: int = 2):
         self.budget = budget_tokens
@@ -143,11 +148,18 @@ class ContextManager:
                         lines.append(f"- 调用工具: {', '.join(names)}")
                     if m.get("content"):
                         lines.append(f"- 助手: {str(m['content'])[:160]}")
+                elif role == "user" and str(m.get("content") or "").startswith(FOLD_HEADER):
+                    # 二次压缩：上一轮的折叠摘要逐行保留（此前会被截成 160 字，早期证据线索丢失）
+                    folded -= 1
+                    lines.extend(l for l in str(m["content"]).splitlines()[1:] if l.strip())
                 else:
                     lines.append(f"- {role}: {str(m.get('content') or '')[:160]}")
+        omitted = max(0, len(lines) - MAX_FOLD_LINES)
+        if omitted:
+            lines = [f"- （更早的 {omitted} 条记录已省略，可用 get_evidence(E#) 取回原始数据）"] + lines[-MAX_FOLD_LINES:]
         folded_msg = {
             "role": "user",
-            "content": "【已压缩的早期观察摘要】以下为本任务更早步骤的精简记录；原始数据可用 get_evidence(E#) 取回：\n" + "\n".join(lines),
+            "content": FOLD_HEADER + "以下为本任务更早步骤的精简记录；原始数据可用 get_evidence(E#) 取回：\n" + "\n".join(lines),
         }
         out = head + [folded_msg] + [m for g in keep for m in g]
         after = messages_tokens(out)

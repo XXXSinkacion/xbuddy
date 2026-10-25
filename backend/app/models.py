@@ -102,7 +102,9 @@ class RunState(BaseModel):
     task_consecutive_errors: int = 0
     task_call_signatures: list[str] = Field(default_factory=list)
     task_evidence: list[str] = Field(default_factory=list)
+    task_ok_evidence: list[str] = Field(default_factory=list)  # 本任务成功（ok/partial/stale）的证据编号
     task_blocks: list[dict] = Field(default_factory=list)
+    task_notes: list[str] = Field(default_factory=list)  # 模板流水线逐步小结（随检查点持久化，恢复后不丢）
     pipeline_index: int = 0
     working_memory: dict = Field(default_factory=dict)
     task_summaries: list[dict] = Field(default_factory=list)
@@ -111,3 +113,6 @@ class RunState(BaseModel):
     pending_tool_call: Optional[dict] = None  # 等待审批的工具调用 {id,name,arguments}
     degrade_reasons: list[str] = Field(default_factory=list)
     stop_requested: bool = False
+    # 等待人工审批 / 进程中断的时长不计入时长预算
+    paused_ms: int = 0
+    paused_at: Optional[int] = None

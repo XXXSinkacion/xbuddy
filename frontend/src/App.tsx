@@ -142,7 +142,8 @@ export default function App() {
   }, [evidence, run]);
 
   const pendingApprovals = run?.approvals.filter((a) => a.status === "pending") || [];
-  const canResume = run && ["interrupted", "stopped", "waiting_approval"].includes(run.status) && pendingApprovals.filter((a) => a.kind !== "memory_write").length === 0;
+  // 只有未结束的运行可恢复（中断 / 失败 / 审批已决定的等待态）；已停止或已完成的运行已出报告，发起新研究即可
+  const canResume = run && run.phase !== "done" && ["interrupted", "failed", "waiting_approval"].includes(run.status) && pendingApprovals.filter((a) => a.kind !== "memory_write").length === 0;
   const u = run?.usage;
 
   return (
@@ -261,7 +262,7 @@ function FaultControls() {
     <div className="faults" title="演示用：注入数据源 / 模型故障，观察降级与恢复">
       <span className="hint">故障注入</span>
       {["fuyao", "llm", "ifind"].map((t) => (
-        <select key={t} value={faults[t]?.mode || "off"} onChange={(e) => set(t, e.target.value)}>
+        <select key={t} value={faults[t]?.mode || "off"} title={faults[t]?.expires_in_s != null ? `${faults[t].expires_in_s}s 后自动恢复` : ""} onChange={(e) => set(t, e.target.value)}>
           <option value="off">{t}: 正常</option>
           <option value="error">{t}: 报错</option>
           <option value="timeout">{t}: 超时</option>
@@ -269,6 +270,7 @@ function FaultControls() {
         </select>
       ))}
       <button className="sm ghost" onClick={() => set("all", "off")}>重置</button>
+      {Object.values(faults).some((f: any) => f?.expires_in_s != null) && <span className="hint">（{Math.max(...Object.values(faults).map((f: any) => f?.expires_in_s ?? 0))}s 后自动恢复）</span>}
     </div>
   );
 }

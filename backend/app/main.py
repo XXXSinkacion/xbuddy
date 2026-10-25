@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from .config import ROOT_DIR, settings
 from .db import loads, now_ms
 from .factory import AppState, build_app_state, connect_ifind
+from .harness.runtime import CapacityError
 
 logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("xbuddy.main")
@@ -50,7 +51,9 @@ class FaultIn(BaseModel):
     count: Optional[int] = None
 
 
-def create_app(state: Optional[AppState] = None) -> FastAPI:
+def create_app(state: Optional[AppState] = None, *, frontend_dist: Optional[Path] = None) -> FastAPI:
+    dist = frontend_dist or FRONTEND_DIST
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         st = state or build_app_state(settings)
@@ -112,6 +115,10 @@ def create_app(state: Optional[AppState] = None) -> FastAPI:
     @app.delete("/api/threads/{thread_id}")
     async def delete_thread(thread_id: str, request: Request):
         st = X(request)
+        # 先停掉线程内仍在进行的运行，避免后台任务继续写入已删除的线程
+        for r in st.db.fetchall("SELECT id FROM runs WHERE thread_id = ? AND status IN ('planning','running','waiting_approval')", [thread_id]):
+            await st.harness.stop(r["id"])
+        await asyncio.sleep(0)
         for table in ("messages", "events", "approvals", "artifacts"):
             st.db.execute(f"DELETE FROM {table} WHERE thread_id = ?", [thread_id])
         for r in st.db.fetchall("SELECT id FROM runs WHERE thread_id = ?", [thread_id]):
@@ -129,8 +136,12 @@ def create_app(state: Optional[AppState] = None) -> FastAPI:
         active = X(request).db.fetchone("SELECT id FROM runs WHERE thread_id = ? AND status IN ('planning','running','waiting_approval')", [thread_id])
         if active:
             raise HTTPException(409, f"线程中已有进行中的运行 {active['id']}，请先停止或等待完成")
+        if len(body.goal) > 2000:
+            raise HTTPException(400, "研究目标过长（上限 2000 字）")
         try:
             return await X(request).harness.start_run(thread_id, body.goal, body.budget)
+        except CapacityError as e:
+            raise HTTPException(429, str(e))
         except ValueError as e:
             raise HTTPException(404, str(e))
 
@@ -321,15 +332,26 @@ def create_app(state: Optional[AppState] = None) -> FastAPI:
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     # ------------------------------------------------------------- 静态前端
-    if FRONTEND_DIST.exists():
-        app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+    if dist.exists():
+        if (dist / "assets").exists():
+            app.mount("/assets", StaticFiles(directory=dist / "assets"), name="assets")
+        dist_root = dist.resolve()
 
         @app.get("/{path:path}", include_in_schema=False)
         async def spa(path: str):
-            target = FRONTEND_DIST / path
-            if path and target.is_file():
-                return FileResponse(target)
-            return FileResponse(FRONTEND_DIST / "index.html")
+            # 安全：路径必须解析在 dist 目录内。uvicorn 会把 %2e%2e%2f 解码成 ../，
+            # 不做校验时可借此读取 dist 之外的任意文件（如 /proc/self/environ 里的 API Key）。
+            if path:
+                try:
+                    target = (dist_root / path).resolve()
+                    target.relative_to(dist_root)
+                except (ValueError, OSError):
+                    raise HTTPException(404, "Not Found")
+                if target.is_file():
+                    return FileResponse(target)
+            if path.startswith("api/"):
+                raise HTTPException(404, "Not Found")
+            return FileResponse(dist_root / "index.html")
 
     return app
 

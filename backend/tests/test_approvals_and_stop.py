@@ -52,7 +52,9 @@ async def test_tool_approval_l2_approve_and_reject(tmp_path):
         r = await wait_run(st.harness, run["id"], until=("completed", "failed", "stopped"))
         assert r["status"] == "completed"
         assert len(st.harness.memory.list()) == before + 1
-        assert any(e["tool"] == "save_memory" and e["status"] == "ok" for e in st.harness.evidence.list(run["id"]))
+        # 写操作可审计（审批记录 + tool.end 事件），但不是数据，不生成可被 [E#] 引用的证据
+        assert not any(e["tool"] == "save_memory" for e in st.harness.evidence.list(run["id"]))
+        assert any(e["type"] == "tool.end" and e["payload"].get("tool") == "save_memory" and e["payload"].get("ok") for e in st.bus.replay(thr["id"], 0, run_id=run["id"]))
 
         # 拒绝路径
         run2 = await st.harness.start_run(thr["id"], "研究贵州茅台")

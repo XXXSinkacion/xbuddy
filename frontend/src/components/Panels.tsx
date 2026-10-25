@@ -99,7 +99,12 @@ export function ArtifactsPanel({ run, onOpen }: { run: Run | null; onOpen: (id: 
       {run.artifacts.map((a) => (
         <div className="card" key={a.id}>
           <div className="hd"><span>📄 {a.title}</span><span className="badge">{a.type}</span></div>
-          <div className="sub">{fmtTime(a.created_at)} · 合规 {a.lint?.ok ? "通过" : "已修正"}{a.lint?.stats ? ` · 移除违规 ${a.lint.stats.forbidden_removed} · 无引用 ${a.lint.stats.uncited}` : ""}</div>
+          <div className="sub">{fmtTime(a.created_at)} · 合规 {a.lint?.ok ? "通过" : "已修正"}{a.lint?.stats ? ` · 移除违规 ${a.lint.stats.forbidden_removed} · 无引用 ${a.lint.stats.uncited}` : ""}{a.lint?.stats?.fact_on_failed ? ` · 失败证据降级 ${a.lint.stats.fact_on_failed}` : ""}</div>
+          {a.lint?.stats?.numbers_checked ? (
+            <div className="sub" title="核心结论【事实】中的数值逐个在所引证据（含其上游证据）的原始字段中查找，按单位换算与显示精度容差比对">
+              数值核验 {a.lint.stats.numbers_verified}/{a.lint.stats.numbers_checked}{a.lint.stats.numbers_unverified ? `（${a.lint.stats.numbers_unverified} 个标“待核”）` : " 全部可回溯到原始字段"}
+            </div>
+          ) : null}
           <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
             <button className="primary sm" onClick={() => onOpen(a.id)}>查看</button>
             <a href={`/api/artifacts/${a.id}/download.md`}><button className="sm">下载 .md</button></a>
@@ -122,7 +127,8 @@ export function ArtifactModal({ id, onClose, onEvidence }: { id: string | null; 
     <div className="modal-bg" onClick={onClose}>
       <div className="modal" onClick={(s) => s.stopPropagation()}>
         <div className="hd"><b>{a?.title || "报告"}</b><div style={{ display: "flex", gap: 6 }}><a href={`/api/artifacts/${id}/download.md`}><button className="sm">下载 .md</button></a><button className="sm" onClick={onClose}>关闭</button></div></div>
-        {a?.lint && !a.lint.ok && <div className="callout warning">合规 Linter 已自动修正：{a.lint.violations.filter((v: any) => v.type === "forbidden").map((v: any) => `「${v.match}」`).join(" ")}</div>}
+        {a?.lint && !a.lint.ok && <div className="callout warning">合规 Linter 已自动修正：{a.lint.violations.filter((v: any) => v.type === "forbidden").map((v: any) => `「${v.match}」`).join(" ")}{a.lint.stats?.fact_on_failed ? ` · ${a.lint.stats.fact_on_failed} 条仅引用失败证据的“事实”已改标不确定` : ""}</div>}
+        {a?.lint?.stats?.numbers_checked ? <div className={`callout ${a.lint.stats.numbers_unverified ? "warning" : "fact"}`}>数值核验：核心结论中 {a.lint.stats.numbers_checked} 个数值，{a.lint.stats.numbers_verified} 个能在所引证据原始字段中找到{a.lint.stats.numbers_unverified ? `，${a.lint.stats.numbers_unverified} 个已在正文标“待核”` : ""}。</div> : null}
         {a ? <Markdown text={a.content_md} onEvidence={onEvidence} /> : <div className="empty">加载中…</div>}
       </div>
     </div>

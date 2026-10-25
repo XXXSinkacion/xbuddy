@@ -216,7 +216,9 @@ class ToolRunner:
         latency_ms = int((time.time() - started) * 1000)
         res.meta.setdefault("latency_ms", latency_ms)
         ev = None
-        if ctx.evidence is not None:
+        # no_evidence 工具（取回旧证据 / 写工作记忆 / 记忆读写）不生成证据：
+        # 否则 get_evidence 会制造重复编号，note_fact 会把模型自己写的文字“洗”成可引用的证据。
+        if ctx.evidence is not None and not res.meta.get("no_evidence"):
             ev = ctx.evidence.record(ctx.run_id, ctx.task_id, spec.name, args, res, latency_ms=latency_ms)
         ctx.emit(
             "tool.end",
@@ -256,7 +258,9 @@ class ToolRunner:
 
         last: Optional[ToolResult] = None
         tool_failed = False
+        attempts = 0
         for attempt in range(spec.max_retries + 1):
+            attempts = attempt + 1
             # 故障注入（演示 / 测试）：模拟数据源错误 / 超时 / 限流，走与真实故障相同的重试-熔断-降级路径
             fault = ctx.faults.active(spec.source)
             if fault:
@@ -303,5 +307,5 @@ class ToolRunner:
         if tool_failed:
             # 端点级熔断按“整次调用失败”计一次：一次调用内的重试不会把端点封死，流水线的 fallback_args 仍可尝试
             ctx.breaker.record_failure(tool_key)
-        last.meta["attempts"] = spec.max_retries + 1
+        last.meta["attempts"] = attempts
         return last

@@ -79,22 +79,30 @@ class CircuitBreaker:
 class FaultInjector:
     """演示 / 测试用故障注入：target ∈ {fuyao, ifind, llm, local}，mode ∈ {error, timeout, ratelimit, off}。"""
 
-    def __init__(self, enabled: bool = True):
+    def __init__(self, enabled: bool = True, ttl_s: Optional[float] = None):
         self.enabled = enabled
+        # 公开演示实例上，访客注入的故障若不过期会让所有人（包括评审）一直看到“数据源不可用”
+        self.ttl_s = ttl_s
         self._faults: dict[str, dict] = {}
 
     def set(self, target: str, mode: str, remaining: Optional[int] = None) -> dict:
         if mode == "off":
             self._faults.pop(target, None)
         else:
-            self._faults[target] = {"mode": mode, "remaining": remaining}
+            self._faults[target] = {"mode": mode, "remaining": remaining, "expires_at": (time.time() + self.ttl_s) if self.ttl_s else None}
         return self.state()
+
+    def _expired(self, f: dict) -> bool:
+        return bool(f.get("expires_at")) and time.time() > f["expires_at"]
 
     def active(self, target: str) -> Optional[str]:
         if not self.enabled:
             return None
         f = self._faults.get(target)
         if not f:
+            return None
+        if self._expired(f):
+            self._faults.pop(target, None)
             return None
         if f["remaining"] is not None:
             if f["remaining"] <= 0:
@@ -106,7 +114,10 @@ class FaultInjector:
         return f["mode"]
 
     def state(self) -> dict:
-        return {k: dict(v) for k, v in self._faults.items()}
+        now = time.time()
+        for k in [k for k, f in self._faults.items() if self._expired(f)]:
+            self._faults.pop(k, None)
+        return {k: {"mode": v["mode"], "remaining": v["remaining"], "expires_in_s": round(v["expires_at"] - now) if v.get("expires_at") else None} for k, v in self._faults.items()}
 
     def clear(self) -> None:
         self._faults.clear()

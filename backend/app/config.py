@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     data_dir: str = "./data"
     log_level: str = "INFO"
     enable_fault_injection: bool = True
+    fault_ttl_s: int = 300  # 注入的故障自动失效（秒）；0 表示不过期
+    # 公开部署保护：全局并发运行上限、每日模型成本上限（超出后新运行降级为模板模式，不再调用模型）
+    max_concurrent_runs: int = 3
+    daily_llm_cost_cap_usd: float = 2.0
 
     model_config = SettingsConfigDict(
         env_file=(str(ROOT_DIR / ".env"), str(BACKEND_DIR / ".env")),
