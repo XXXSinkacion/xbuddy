@@ -72,7 +72,7 @@ class Recorder:
     def __init__(self, out: str):
         self.proc = subprocess.Popen(
             [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-f", "image2pipe", "-framerate", str(FPS), "-c:v", "mjpeg", "-i", "-",
-             "-vf", f"scale={W}:{H}:flags=lanczos", "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart", out],
+             "-vf", f"scale={W}:{H}:flags=lanczos:in_range=pc:out_range=tv,format=yuv420p", "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-color_range", "tv", "-movflags", "+faststart", out],
             stdin=subprocess.PIPE,
         )
         self.speed = 1.0
