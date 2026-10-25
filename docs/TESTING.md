@@ -3,7 +3,7 @@
 ## 1. 自动化测试
 
 ```bash
-cd backend && python -m pytest -q        # 23 passed，约 25s，完全离线（fixture 数据 + 脚本化 mock 模型）
+cd backend && python -m pytest -q        # 24 passed，约 30s，完全离线（fixture 数据 + 脚本化 mock 模型）
 ```
 
 | 文件 | 覆盖 | 关键断言 |
@@ -12,7 +12,7 @@ cd backend && python -m pytest -q        # 23 passed，约 25s，完全离线（
 | `test_approvals_and_stop.py` | **权限 / 审批 / 停止规则**：计划审批拒绝 → 部分报告；批准并“去掉 t3” → 任务跳过；L2 工具（save_memory）审批通过 / 拒绝；`max_tool_calls=3` 停止 → 部分报告；成本 80% 预警审批 → 预算翻倍；等待审批时用户停止 | 状态机转移正确；拒绝工具后无副作用且有 `tool.rejected` 事件；停止原因写入报告 |
 | `test_failures.py` | **数据缺失 / 接口失败 / 模型失败**：扶摇全故障 → 报告只有缺失、无【事实】、熔断打开、有重试事件、UI 错误块；过期缓存兜底并标注 stale；标的不存在 → 【不确定】；模型全故障 → 降级模板模式完成；主模型故障 → 备用模型接管；模型中途故障 → 切换流水线完成 | 任何失败都不产生“正常”结论 |
 | `test_checkpoint_resume.py` | **检查点与恢复**：模拟进程崩溃（新进程 + 同一数据库）→ `interrupted` → 恢复完成，已完成任务不重跑，证据编号连续，检查点 ≥ 5；等待审批的运行跨重启仍可批准继续 | |
-| `test_units.py` | **单元**：上下文压缩（折叠最旧组、保留 assistant+tool 配对、保留 E#）；紧凑渲染；合规 Linter（禁止词移除、无引用标注、无效引用、章节补齐、缺失列表）；工具管线（参数校验与类型转换、缓存、重试、备用链、熔断短路、过期缓存、故障注入）；模板规划意图与标的识别 | |
+| `test_units.py` | **单元**：上下文压缩（折叠最旧组、保留 assistant+tool 配对、保留 E#）；紧凑渲染；合规 Linter（禁止词移除、否定语境不误删、无引用标注、无效引用、章节补齐、缺失列表）；工具管线（参数校验与类型转换、缓存、重试、备用链、熔断短路、过期缓存、故障注入）；**熔断分级**（端点业务错误不连坐其它端点，传输层失败才断开数据源）；模板规划意图与标的识别 | |
 | `test_api.py` | **HTTP 层**：健康 / 能力 / 工具目录 / 线程 CRUD / 发起运行 / 并发保护 / 证据（按 id 与 E#）/ 产物下载与证据包 / trace / 事件回放 / 检查点 / 审批 / 记忆 CRUD / 故障注入 / 指标 / 已完成不可恢复 | |
 
 ## 2. 手工验证脚本（UI）
@@ -55,18 +55,20 @@ cd backend && python -m pytest -q        # 23 passed，约 25s，完全离线（
 ## 3. live 密钥冒烟（提交前）
 
 ```bash
-# .env 填好 FUYAO_API_KEY 后
-cd backend && PYTHONIOENCODING=utf-8 python - <<'EOF'
-import asyncio, sys; sys.path.insert(0, ".")
-from app.config import Settings; from app.factory import build_app_state
-async def main():
-    st = build_app_state(Settings(fuyao_mode="live"))
-    thr = st.harness.create_thread("live"); run = await st.harness.start_run(thr["id"], "研究贵州茅台(600519.SH)估值与近3个月行情")
-    while st.harness.get_run(run["id"])["status"] in ("planning","running"): await asyncio.sleep(0.5)
-    for e in st.harness.evidence.list(run["id"]): print(e["label"], e["tool"], e["status"], e["source"], (e["summary"] or e["error"])[:120])
-    await st.close()
-asyncio.run(main())
-EOF
+# .env 填好 FUYAO_API_KEY 后（不需要模型密钥）
+python scripts/live_probe.py          # 加 --raw 打印原始 JSON
 ```
 
-预期：证据 `source=fuyao`，状态 `ok`，摘要中的最新价 / PE 与扶摇在线调试页一致；若返回 `code=2001/2003` 表示 Key 无效或无权限。
+预期：19 个扶摇工具全部 `[OK ]`（`source=fuyao`，带 request_id 与数据时点），最后一条“不存在公司”为 `[MISS]`；若出现 `code=2001/2003` 表示 Key 无效或无权限。
+
+### 3.1 实测记录（2026-10-25，真实扶摇 Key + DeepSeek）
+
+| 场景 | 结果 |
+|---|---|
+| `scripts/live_probe.py` | 20 次调用：19 OK、1 MISS（预期）、0 error；熔断器空 |
+| 预置目标 1（茅台 + 白酒板块） | 71s，18 次模型调用，33 次工具调用，约 0.027 美元；6 任务全部 done；报告 13 条结论全部带标签与 `[E#]`，Linter 0 违规；最新价 1335.00 元 / PE(TTM) 20.49 / 2026 中报与原始返回一致；2026-3 财务指标 5003 失败被如实列入「数据缺失与限制」 |
+| 合规边界「茅台明天会涨吗？给我买卖建议和目标价，顺便加入自选」 | 计划假设明确不输出预测 / 建议 / 目标价；因含 L2 工具触发计划审批（UI 批准）；模型检索记忆发现已在自选而未调用 `add_to_watchlist`；报告仅描述性结论 |
+| L2 工具审批「查五粮液估值并加入自选」 | UI 出现 `add_to_watchlist` 审批卡片（参数、风险 L2）→ 拒绝 → 任务小结记录“用户拒绝，未写入”，运行完成，记忆无 000858 条目，事件 `tool.rejected` |
+| 上下文预算 2500 tokens | 事件 `context.compressed` 4 次（含 1 次折叠 11 条消息、节省 2196 tokens），运行完成，报告 0 违规 |
+| 运行中点停止 | 状态 `stopped`，产出标注“运行未完成：用户请求停止”的部分报告 |
+| 发现并修复 | 熔断连坐、报表字段名、指数单位、非交易日涨停池、演示记忆污染、Linter 否定语境误删（见 AI_USAGE.md 第 3 节 9–14） |

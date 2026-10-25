@@ -19,6 +19,25 @@ FORBIDDEN_PATTERNS: list[tuple[str, str]] = [
     (r"翻倍|十倍股|牛股|妖股", "夸张表述"),
 ]
 REMOVED_MARK = "[已按合规规则移除：疑似确定性预测或交易建议]"
+# live 实测教训：模型常在摘要里写“本报告不输出涨跌预测、买卖建议或目标价”，这是合规声明而非违规；
+# 命中前 20 字内（不跨逗号 / 分号）出现否定词即视为否定语境，不移除。
+NEGATION_RE = re.compile(r"(不|未|无|没有|拒绝|排除|并非|而非|非)")
+
+
+def _negated(text: str, start: int) -> bool:
+    prefix = text[max(0, start - 20):start]
+    prefix = re.split(r"[，,；;]", prefix)[-1]  # 顿号 / “或 / 和”属于同一否定语境的并列，不切断
+    return bool(NEGATION_RE.search(prefix))
+
+
+def _violations_in(text: str) -> list[tuple[str, str]]:
+    """返回 (匹配文本, 类型) 列表，已剔除否定语境中的命中。"""
+    hits = []
+    for pat, kind in FORBIDDEN_PATTERNS:
+        for m in re.finditer(pat, text):
+            if not _negated(text, m.start()):
+                hits.append((m.group(0), kind))
+    return hits
 REQUIRED_SECTIONS = ["核心结论", "数据口径与时点", "数据缺失与限制", "证据清单", "免责声明"]
 CITATION_RE = re.compile(r"\[(E\d+)\]")
 LABEL_RE = re.compile(r"【(事实|推断|不确定)】")
@@ -48,9 +67,8 @@ def _split_sentences(text: str) -> list[str]:
 def scan_forbidden(md: str) -> list[dict]:
     hits = []
     for line_no, line in enumerate(md.splitlines(), 1):
-        for pat, kind in FORBIDDEN_PATTERNS:
-            for m in re.finditer(pat, line):
-                hits.append({"type": "forbidden", "kind": kind, "match": m.group(0), "line": line_no, "text": line.strip()[:160]})
+        for match, kind in _violations_in(line):
+            hits.append({"type": "forbidden", "kind": kind, "match": match, "line": line_no, "text": line.strip()[:160]})
     return hits
 
 
@@ -58,11 +76,11 @@ def remove_forbidden(md: str) -> tuple[str, int]:
     out_lines = []
     removed = 0
     for line in md.splitlines():
-        if any(re.search(p, line) for p, _ in FORBIDDEN_PATTERNS):
+        if _violations_in(line):
             sentences = _split_sentences(line)
             new = []
             for s in sentences:
-                if any(re.search(p, s) for p, _ in FORBIDDEN_PATTERNS):
+                if _violations_in(s):
                     removed += 1
                     # 保留列表符号与引用
                     prefix = re.match(r"^\s*(?:[-*]|\d+\.)\s*", s)

@@ -75,17 +75,17 @@ class FuyaoBackend:
         try:
             r = await self._http.get(path, params={k: v for k, v in params.items() if v is not None})
         except httpx.TimeoutException as e:
-            raise ToolError(f"扶摇请求超时：{e}", retryable=True) from e
+            raise ToolError(f"扶摇请求超时：{e}", retryable=True, transport=True) from e
         except httpx.HTTPError as e:
-            raise ToolError(f"扶摇网络错误：{e}", retryable=True) from e
+            raise ToolError(f"扶摇网络错误：{e}", retryable=True, transport=True) from e
         if r.status_code == 429:
-            raise ToolError("扶摇频率超限（HTTP 429）", retryable=True, code=4001)
+            raise ToolError("扶摇频率超限（HTTP 429）", retryable=True, code=4001, transport=True)
         if r.status_code >= 500:
-            raise ToolError(f"扶摇服务端错误 HTTP {r.status_code}", retryable=True, code=5001)
+            raise ToolError(f"扶摇服务端错误 HTTP {r.status_code}", retryable=True, code=5001, transport=True)
         try:
             body = r.json()
         except ValueError as e:
-            raise ToolError(f"扶摇响应非 JSON（HTTP {r.status_code}）", retryable=True) from e
+            raise ToolError(f"扶摇响应非 JSON（HTTP {r.status_code}）", retryable=True, transport=True) from e
         code = body.get("code", -1)
         rid = body.get("request_id")
         if code == 0:
@@ -94,7 +94,8 @@ class FuyaoBackend:
         if code in MISSING_CODES:
             raise ToolError(f"扶摇 code={code}：{msg}", retryable=False, code=code, request_id=rid, status="missing")
         if code in RETRYABLE_CODES:
-            raise ToolError(f"扶摇 code={code}：{msg}", retryable=True, code=code, request_id=rid)
+            # 4001 限流 / 5001 服务错误是数据源整体状况；5003“数据源不可用”实测常见于单个端点或单个参数（如未披露的报告期），不连坐其它端点
+            raise ToolError(f"扶摇 code={code}：{msg}", retryable=True, code=code, request_id=rid, transport=code in (4001, 5001))
         if code in (2001, 2003):
             raise ToolError(f"扶摇鉴权/权限错误 code={code}：{msg}（请检查 FUYAO_API_KEY）", retryable=False, code=code, request_id=rid)
         raise ToolError(f"扶摇参数/业务错误 code={code}：{msg}", retryable=False, code=code, request_id=rid)
@@ -180,10 +181,10 @@ def register_fuyao_tools(registry: ToolRegistry, backend: FuyaoBackend) -> list[
     reg(ToolSpec(name="get_trading_days", description="获取 A 股近一年交易日序列（用于确定最近交易日、计算日期区间）。", parameters={"type": "object", "properties": {}}, handler=get_trading_days, risk="L0", source="fuyao", cacheable=True, cache_ttl_s=6 * 3600, tags=("calendar",)))
 
     # ---- 行情快照 ----
-    def _snapshot_summary(items: list[dict]) -> str:
+    def _snapshot_summary(items: list[dict], unit: str = "元") -> str:
         parts = []
         for it in items[:6]:
-            parts.append(f"{it['thscode']} 最新 {it.get('last_price')} 元，涨跌幅 {it.get('price_change_ratio_pct')}%，成交额 {round((it.get('turnover') or 0) / 1e8, 2)} 亿元")
+            parts.append(f"{it['thscode']} 最新 {it.get('last_price')} {unit}，涨跌幅 {it.get('price_change_ratio_pct')}%，成交额 {round((it.get('turnover') or 0) / 1e8, 2)} 亿元")
         return "；".join(parts)
 
     async def get_quote_snapshot(args: dict, ctx: ToolContext) -> ToolResult:
@@ -204,7 +205,7 @@ def register_fuyao_tools(registry: ToolRegistry, backend: FuyaoBackend) -> list[
         items = body["data"].get("item", [])
         if not items:
             return ToolResult.missing(f"未返回 {codes} 的指数快照", source=src, request_id=body.get("request_id"))
-        return ToolResult(ok=True, data=body["data"], source=src, data_timestamp=body["data"].get("timestamp"), request_id=body.get("request_id"), unit_notes="指数点位；涨跌幅为百分比数值；成交额单位元", summary=_snapshot_summary(items) + f"；数据时点 {fmt_ts(body['data'].get('timestamp'))}")
+        return ToolResult(ok=True, data=body["data"], source=src, data_timestamp=body["data"].get("timestamp"), request_id=body.get("request_id"), unit_notes="指数点位（点）；涨跌幅为百分比数值；成交额单位元", summary=_snapshot_summary(items, "点") + f"；数据时点 {fmt_ts(body['data'].get('timestamp'))}")
 
     reg(ToolSpec(name="get_index_snapshot", description="批量获取指数 / 同花顺板块最新行情快照（如 000001.SH 上证指数、000300.SH 沪深300、399006.SZ 创业板指、8xxxxx.TI 同花顺板块）。", parameters={"type": "object", "properties": {"thscodes": {"type": "string", "description": "逗号分隔的指数 thscode"}}, "required": ["thscodes"]}, handler=get_index_snapshot, risk="L0", source="fuyao", cacheable=True, cache_ttl_s=60, tags=("prices", "index")))
 
@@ -296,8 +297,10 @@ def register_fuyao_tools(registry: ToolRegistry, backend: FuyaoBackend) -> list[
         reg(ToolSpec(name=name, description=f"获取单只 A 股合并{zh}多期序列（最近 N 期，annual 年报 / quarterly 季报）。", parameters={"type": "object", "properties": {"thscode": {"type": "string"}, "period": {"type": "string", "enum": ["annual", "quarterly"], "default": "annual"}, "limit": {"type": "integer", "default": 4, "description": "1-20"}}, "required": ["thscode"]}, handler=handler, risk="L1", source="fuyao", cacheable=True, cache_ttl_s=86400, tags=("financials",)))
 
     make_statement_tool("get_income_statements", "/api/a-share/financials/income-statements", "利润表", {"operating_income": "营收", "net_profit": "净利润", "parent_holder_net_profit": "归母净利润", "basic_eps": "EPS"})
-    make_statement_tool("get_balance_sheets", "/api/a-share/financials/balance-sheets", "资产负债表", {"total_assets": "总资产", "total_liabilities": "总负债", "total_equity": "所有者权益"})
-    make_statement_tool("get_cash_flow_statements", "/api/a-share/financials/cash-flow-statements", "现金流量表", {"net_cash_flows_from_operating_activities": "经营现金流净额", "net_cash_flows_from_investing_activities": "投资现金流净额"})
+    # 字段名以扶摇 live 实际返回为准（2026-10-25 实测）：资产负债表 assets_total / total_debt / holder_equity_total / cash，
+    # 现金流量表 act_cash_flow_net / invest_cash_flow_net / financing_cash_flow_net
+    make_statement_tool("get_balance_sheets", "/api/a-share/financials/balance-sheets", "资产负债表", {"assets_total": "总资产", "total_debt": "总负债", "holder_equity_total": "所有者权益", "cash": "货币资金"})
+    make_statement_tool("get_cash_flow_statements", "/api/a-share/financials/cash-flow-statements", "现金流量表", {"act_cash_flow_net": "经营现金流净额", "invest_cash_flow_net": "投资现金流净额", "financing_cash_flow_net": "筹资现金流净额"})
 
     # ---- 指数 / 板块 ----
     async def find_ths_index(args: dict, ctx: ToolContext) -> ToolResult:
@@ -329,11 +332,22 @@ def register_fuyao_tools(registry: ToolRegistry, backend: FuyaoBackend) -> list[
             params["date_ms"] = parse_date_ms(args["date"])
         body = await call("/api/a-share/special-data/limit-up-pool", params)
         items = body["data"].get("item", [])
+        used_date = args.get("date") or "当日"
+        if not items and not args.get("date"):
+            # 非交易日 / 盘前当日池为空：回退到最近一个交易日，并把所用日期显式写进口径，不冒充当日
+            cal = await call("/api/a-share/calendar/trading-days", {})
+            days = cal["data"].get("item", [])
+            if days:
+                d = days[-1]["date"]
+                used_date = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+                params["date_ms"] = parse_date_ms(used_date)
+                body = await call("/api/a-share/special-data/limit-up-pool", params)
+                items = body["data"].get("item", [])
         total = (body["data"].get("pagination") or {}).get("total", len(items))
         if not items:
-            return ToolResult.missing("涨停池为空（非交易日或数据未就绪）", source=src, request_id=body.get("request_id"))
+            return ToolResult.missing(f"涨停池为空（{used_date}，非交易日或数据未就绪）", source=src, request_id=body.get("request_id"))
         top = "、".join(f"{i['name']}({i.get('continue_day_text')})" for i in items[:8])
-        return ToolResult(ok=True, data=body["data"], source=src, data_timestamp=body["data"].get("timestamp"), request_id=body.get("request_id"), unit_notes="封单额单位元；涨跌幅百分比；连板计数为交易日", summary=f"涨停池共 {total} 只，连板居前：{top}；时点 {fmt_ts(body['data'].get('timestamp'))}")
+        return ToolResult(ok=True, data=body["data"] | {"trade_date": used_date}, source=src, data_timestamp=body["data"].get("timestamp"), request_id=body.get("request_id"), unit_notes=f"交易日 {used_date}；封单额单位元；涨跌幅百分比；连板计数为交易日", summary=f"{used_date} 涨停池共 {total} 只，连板居前：{top}；时点 {fmt_ts(body['data'].get('timestamp'))}")
 
     reg(ToolSpec(name="get_limit_up_pool", description="获取某交易日 A 股涨停 / 连板股票池（涨停时间、原因、连板数、封单额）。", parameters={"type": "object", "properties": {"date": {"type": "string", "description": "YYYY-MM-DD，省略为当日"}, "size": {"type": "integer", "default": 50}}}, handler=get_limit_up_pool, risk="L0", source="fuyao", cacheable=True, cache_ttl_s=300, tags=("sentiment",)))
 

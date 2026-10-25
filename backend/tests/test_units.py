@@ -54,6 +54,10 @@ def test_linter_removes_forbidden_marks_uncited_and_adds_sections():
     assert "[E2] get_kline — 数据缺失" in res.md
     assert res.stats["forbidden_removed"] == 1 and res.stats["uncited"] >= 1 and res.stats["bad_citations"] == 1
     assert scan_forbidden("预计将大幅上涨") and scan_forbidden("目标价 100 元") and not scan_forbidden("区间涨跌 5.64%")
+    # 否定语境是合规声明，不是违规（live 实测：摘要里的“不输出…目标价”曾被误删）
+    assert not scan_forbidden("本报告不输出涨跌预测、买卖建议或目标价，仅做数据整理")
+    assert not scan_forbidden("本任务不构成交易建议，也不提供目标价 [E1]")
+    assert scan_forbidden("不要犹豫，目标价 1500 元") and scan_forbidden("有望大幅上涨")
 
 
 @pytest.mark.asyncio
@@ -64,7 +68,7 @@ async def test_tool_runner_validation_cache_retry_breaker_fallback():
     async def a(args, ctx):
         calls["a"] += 1
         if args.get("fail"):
-            raise ToolError("5003 数据源不可用", retryable=True)
+            raise ToolError("数据源超时", retryable=True, transport=True)
         return ToolResult(ok=True, data={"v": args["x"]}, summary="ok", source="src_a")
 
     async def b(args, ctx):
@@ -130,3 +134,48 @@ def test_run_state_roundtrip():
     s = RunState(phase="execute", working_memory={"a": 1})
     s2 = RunState(**s.model_dump())
     assert s2.working_memory == {"a": 1} and s2.phase == "execute"
+
+
+async def test_breaker_scopes_business_error_does_not_block_sibling_tools():
+    """live 实测暴露的问题：某端点返回 5003（业务错误）后，同数据源其它端点不应被连坐熔断；
+    传输层失败（超时 / 5xx）才计入数据源级熔断。"""
+    reg = ToolRegistry()
+    calls = {"bad": 0, "good": 0, "flaky": 0}
+
+    async def bad(args, ctx):
+        calls["bad"] += 1
+        raise ToolError("扶摇 code=5003：Data source unavailable", retryable=True, code=5003)
+
+    async def good(args, ctx):
+        calls["good"] += 1
+        return ToolResult(ok=True, data={"v": 1}, summary="ok", source="fuyao")
+
+    async def flaky(args, ctx):
+        calls["flaky"] += 1
+        raise ToolError("扶摇请求超时", retryable=True, transport=True)
+
+    for name, h in (("bad", bad), ("good", good), ("flaky", flaky)):
+        reg.register(ToolSpec(name=name, description="", parameters={"type": "object", "properties": {"k": {"type": "integer"}}}, handler=h, source="fuyao", cacheable=False, max_retries=2))
+    runner = ToolRunner(reg)
+    ctx = ToolContext(run_id="r", task_id=None, settings=None, evidence=None, emit=lambda t, p: None, working_memory={}, cache=TTLCache(), breaker=CircuitBreaker(threshold=3, window_s=60, open_s=60), faults=FaultInjector(), registry=reg)
+
+    # 一次业务失败（含 2 次重试）：端点级只记 1 次，不开；数据源级不计
+    res, _ = await runner.invoke("bad", {"k": 1}, ctx)
+    assert not res.ok and calls["bad"] == 3
+    assert not ctx.breaker.is_open("fuyao") and not ctx.breaker.is_open("fuyao:bad")
+    res, _ = await runner.invoke("good", {"k": 1}, ctx)
+    assert res.ok and calls["good"] == 1
+    # 三次独立失败调用后端点级熔断打开；其它端点仍可用
+    await runner.invoke("bad", {"k": 2}, ctx)
+    await runner.invoke("bad", {"k": 3}, ctx)
+    assert ctx.breaker.is_open("fuyao:bad") and not ctx.breaker.is_open("fuyao")
+    n = calls["bad"]
+    res, _ = await runner.invoke("bad", {"k": 4}, ctx)
+    assert calls["bad"] == n and res.meta.get("circuit_open") and "接口 bad 熔断中" in res.error
+    res, _ = await runner.invoke("good", {"k": 2}, ctx)
+    assert res.ok and calls["good"] == 2
+    # 传输层失败：一次调用内 3 次超时即判定数据源不可用，所有端点短路
+    res, _ = await runner.invoke("flaky", {"k": 1}, ctx)
+    assert not res.ok and calls["flaky"] == 3 and ctx.breaker.is_open("fuyao")
+    res, _ = await runner.invoke("good", {"k": 3}, ctx)
+    assert not res.ok and res.meta.get("circuit_open") and calls["good"] == 2

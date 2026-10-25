@@ -27,12 +27,15 @@ RISK_LABELS = {
 
 
 class ToolError(Exception):
-    def __init__(self, message: str, *, retryable: bool = False, code: Optional[int] = None, request_id: Optional[str] = None, status: str = "error"):
+    def __init__(self, message: str, *, retryable: bool = False, code: Optional[int] = None, request_id: Optional[str] = None, status: str = "error", transport: bool = False):
         super().__init__(message)
         self.retryable = retryable
         self.code = code
         self.request_id = request_id
         self.status = status
+        # transport=True 表示传输层/整体不可用（超时、网络、HTTP 5xx/429），计入数据源级熔断；
+        # 业务错误（如某个端点 5003）只计入端点级熔断，不影响同数据源其它端点。
+        self.transport = transport
 
 
 @dataclass
@@ -244,18 +247,23 @@ class ToolRunner:
                 res.meta["cached"] = True
                 return res
 
-        # 熔断
+        # 熔断：数据源级（传输层连续失败）与端点级（该工具连续失败）分别判断
+        tool_key = f"{spec.source}:{spec.name}"
         if ctx.breaker.is_open(spec.source):
             return ToolResult.fail(f"数据源 {spec.source} 熔断中（近期连续失败），已跳过调用", status="error", retryable=True, source=spec.source, circuit_open=True)
+        if ctx.breaker.is_open(tool_key):
+            return ToolResult.fail(f"接口 {spec.name} 熔断中（该端点近期连续失败），已跳过调用", status="error", retryable=True, source=spec.source, circuit_open=True)
 
         last: Optional[ToolResult] = None
+        tool_failed = False
         for attempt in range(spec.max_retries + 1):
             # 故障注入（演示 / 测试）：模拟数据源错误 / 超时 / 限流，走与真实故障相同的重试-熔断-降级路径
             fault = ctx.faults.active(spec.source)
             if fault:
                 msg = {"error": "注入故障：数据源返回 5003 数据源不可用", "timeout": "注入故障：数据源超时", "ratelimit": "注入故障：HTTP 429 / code=4001 频率超限"}.get(fault, f"注入故障：{fault}")
-                res = ToolResult.fail(msg, status="error", retryable=True, source=spec.source, injected=True)
+                res = ToolResult.fail(msg, status="error", retryable=True, source=spec.source, injected=True, transport=True)
                 last = res
+                tool_failed = True
                 ctx.breaker.record_failure(spec.source)
                 if attempt >= spec.max_retries:
                     break
@@ -265,9 +273,9 @@ class ToolRunner:
             try:
                 res = await asyncio.wait_for(spec.handler(args, ctx), timeout=spec.timeout_s)
             except asyncio.TimeoutError:
-                res = ToolResult.fail(f"工具超时（>{spec.timeout_s}s）", status="error", retryable=True, source=spec.source)
+                res = ToolResult.fail(f"工具超时（>{spec.timeout_s}s）", status="error", retryable=True, source=spec.source, transport=True)
             except ToolError as e:
-                res = ToolResult.fail(str(e), status=e.status if e.status in ("error", "missing") else "error", retryable=e.retryable, source=spec.source, code=e.code)
+                res = ToolResult.fail(str(e), status=e.status if e.status in ("error", "missing") else "error", retryable=e.retryable, source=spec.source, code=e.code, transport=e.transport)
                 res.request_id = e.request_id
             except Exception as e:  # noqa: BLE001
                 log.exception("tool %s crashed", spec.name)
@@ -275,6 +283,7 @@ class ToolRunner:
             last = res
             if res.ok:
                 ctx.breaker.record_success(spec.source)
+                ctx.breaker.record_success(tool_key)
                 if spec.cacheable:
                     ctx.cache.set(key, res.model_dump())
                 res.meta["attempts"] = attempt + 1
@@ -282,11 +291,17 @@ class ToolRunner:
             if res.status == "missing":
                 # 数据缺失不是故障，不重试、不计熔断
                 return res
-            ctx.breaker.record_failure(spec.source)
+            tool_failed = True
+            if res.meta.get("transport"):
+                # 传输层失败按尝试次数计入数据源级熔断（连续超时 / 5xx / 429 即判定数据源整体不可用）
+                ctx.breaker.record_failure(spec.source)
             if not res.retryable or attempt >= spec.max_retries:
                 break
             await asyncio.sleep(min(0.5 * (2**attempt), 2.0))
             ctx.emit("tool.retry", {"tool": spec.name, "attempt": attempt + 1, "error": res.error})
         assert last is not None
+        if tool_failed:
+            # 端点级熔断按“整次调用失败”计一次：一次调用内的重试不会把端点封死，流水线的 fallback_args 仍可尝试
+            ctx.breaker.record_failure(tool_key)
         last.meta["attempts"] = spec.max_retries + 1
         return last

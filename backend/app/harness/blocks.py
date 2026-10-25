@@ -6,6 +6,13 @@ from typing import Any, Optional
 from ..models import ToolResult
 from ..tools.fuyao import fmt_ts
 
+STATEMENT_NAMES = {
+    "assets_total": "总资产", "total_current_assets": "流动资产", "non_current_nets_total": "非流动资产", "cash": "货币资金", "accounts_receivable": "应收账款",
+    "total_debt": "总负债", "holder_equity_total": "所有者权益",
+    "act_cash_flow_net": "经营现金流净额", "invest_cash_flow_net": "投资现金流净额", "financing_cash_flow_net": "筹资现金流净额",
+    "pay_fixed_assets_etc_cash": "购建固定资产支付", "pay_dividends_profits_interest_cash": "分配股利/付息支付", "cash_equivalents_net_addition": "现金净增加额",
+}
+
 INDICATOR_NAMES = {
     "total_assets_growth_ratio": "总资产增长率%",
     "net_profit_yoy_growth_ratio": "净利润同比%",
@@ -91,7 +98,7 @@ def blocks_from_result(tool: str, result: ToolResult, label: Optional[str]) -> l
             rows = [[f"{it.get('fiscal_year')}{it.get('fiscal_period')}", _num((it.get("operating_income") or 0) / 1e8), _num((it.get("net_profit") or 0) / 1e8), _num((it.get("parent_holder_net_profit") or 0) / 1e8), _num(it.get("basic_eps"), 4)] for it in items]
         else:
             keys = [k for k, v in items[0].items() if isinstance(v, (int, float)) and k not in ("fiscal_year", "report_date_ms", "period_end_ms")][:5]
-            cols = ["报告期"] + [k + "(亿)" for k in keys]
+            cols = ["报告期"] + [STATEMENT_NAMES.get(k, k) + "(亿)" for k in keys]
             rows = [[f"{it.get('fiscal_year')}{it.get('fiscal_period')}"] + [_num((it.get(k) or 0) / 1e8) for k in keys] for it in items]
         blocks.append({"type": "table", "title": {"get_income_statements": "利润表", "get_balance_sheets": "资产负债表", "get_cash_flow_statements": "现金流量表"}[tool], "evidence": label, "columns": cols, "rows": rows})
     elif tool == "get_index_constituents" and items:

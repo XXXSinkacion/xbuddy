@@ -114,6 +114,10 @@ def propose_memories(goal: str, md: str, evidence: list[dict], run_id: str) -> l
     """从报告中提炼可写入长期记忆的条目（需审批）。"""
     out = []
     day = datetime.now(TZ).strftime("%Y-%m-%d")
+    # live 实测教训：演示数据运行写入的记忆（如 fixture 板块代码 885613.TI）会在后续真实运行中被当作先验；
+    # 因此凡来自演示数据的记忆都显式打标，供后续运行与用户辨别。
+    demo = any("演示" in str(e.get("source") or "") or "fixture" in str(e.get("source") or "") for e in evidence)
+    suffix = "（来源：演示数据运行，非真实行情）" if demo else ""
     # 结论摘要
     i = md.find("## 核心结论")
     if i != -1:
@@ -122,8 +126,8 @@ def propose_memories(goal: str, md: str, evidence: list[dict], run_id: str) -> l
         seg = seg if nxt == -1 else seg[:nxt]
         bullets = [l.strip() for l in seg.splitlines() if l.strip().startswith("-") and "【事实】" in l][:3]
         if bullets:
-            out.append({"kind": "conclusion", "content": f"{day} 研究「{goal[:40]}」事实要点：" + " ".join(b.lstrip('- ') for b in bullets)[:400], "tags": f"conclusion,{day}"})
+            out.append({"kind": "conclusion", "content": f"{day} 研究「{goal[:40]}」事实要点：" + " ".join(b.lstrip('- ') for b in bullets)[:400] + suffix, "tags": f"conclusion,{day}" + (",demo" if demo else "")})
     codes = sorted({e.get("args", {}).get("thscode") for e in evidence if isinstance(e.get("args"), dict) and e.get("args", {}).get("thscode")})
     if codes:
-        out.append({"kind": "note", "content": f"{day} 研究过的标的：{', '.join(codes[:6])}（目标：{goal[:40]}）", "tags": "history," + ",".join(codes[:6])})
+        out.append({"kind": "note", "content": f"{day} 研究过的标的：{', '.join(codes[:6])}（目标：{goal[:40]}）" + suffix, "tags": "history," + ",".join(codes[:6]) + (",demo" if demo else "")})
     return out
