@@ -1,0 +1,27 @@
+# secrets
+.env
+backend/.env
+*.key
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# node
+node_modules/
+frontend/dist/
+
+# data / logs
+data/
+logs/
+*.db
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# misc
+.DS_Store
+Thumbs.db
