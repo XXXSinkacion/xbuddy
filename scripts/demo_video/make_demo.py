@@ -1,13 +1,7 @@
 """投资 X Buddy 演示视频：全自动录制 + 字幕 + 快进 + 片头片尾，输出 1080p MP4。
 
-依赖（不在后端 requirements 里，仅录制时需要）：
-    pip install playwright imageio-ffmpeg && python -m playwright install chromium
-
-用法：
-    # 1) 用真实密钥（.env）和一个空数据目录启动后端，保证侧栏只有本次录制的线程
-    cd backend && DATA_DIR=/tmp/xbuddy-demo python -m uvicorn app.main:app --port 8767
-    # 2) 另开终端录制（约 4 分钟，产出约 2 分钟的 1080p MP4；会调用真实模型，约 0.05 美元）
-    python scripts/demo_video/make_demo.py --base http://127.0.0.1:8767 --out xbuddy-demo.mp4
+用法（先在本机启动后端，见同目录 README 说明）：
+    python make_demo.py [--base http://127.0.0.1:8767] [--out ../xbuddy-demo.mp4] [--skip-prep]
 
 流程：
 1. 预跑：通过 API 注入扶摇故障 → 跑一个研究（作为“故障降级”片段的素材）→ 拒绝其记忆写入 → 清除故障。
@@ -117,6 +111,31 @@ class Director:
         self.page = page
         self.rec = rec
         self.x, self.y = W * 0.55, H * 0.5
+        self.narr: dict[str, float] = {}  # 每段旁白时长（秒）
+        self.timeline: list[tuple[str, float]] = []  # (旁白键, 在成片中的起始秒)
+        self.cur: tuple[str, float] | None = None
+
+    def now(self) -> float:
+        self.rec.tick()
+        return self.rec.seconds
+
+    def begin(self, key: str) -> None:
+        self.cur = (key, self.now())
+        self.timeline.append(self.cur)
+
+    async def gate(self) -> None:
+        """当前字幕的旁白没念完之前，不切到下一条（按成片时间计，快进段同样适用）。"""
+        if not self.cur:
+            return
+        key, start = self.cur
+        left = self.narr.get(key, 0.0) + 0.35 - (self.now() - start)
+        if left > 0:
+            await self.hold(left)
+
+    async def say(self, key: str, step: str, text: str, pos: str = "top") -> None:
+        await self.gate()
+        await self.caption(step, text, pos)
+        self.begin(key)
 
     async def setup(self) -> None:
         await self.page.evaluate(f"document.documentElement.style.zoom = '{Z}'")
@@ -185,6 +204,27 @@ class Director:
             await self.hold(pause)
 
 
+# 旁白稿：与字幕一一对应，改写成口语（去掉箭头、[E#] 等符号）
+NARRATION = {
+    "title": "投资 X Buddy，一个面向投资研究者的个人 Agent 工作台。",
+    "c1": "给出一个研究目标，Agent 会规划任务，调用真实的金融数据工具，记录并核验证据，最后产出可以回溯的研究报告。",
+    "c2": "先把计划确认设为始终审批，再选择预置目标：研究贵州茅台的行情、估值和财务，并与白酒板块对比。",
+    "c3": "模型把目标拆成可验收的任务，每个任务写明要用的工具和验收标准。",
+    "c4": "关键决策由人来确认，批准之后才开始执行。",
+    "c5": "执行阶段，每一次工具调用都会生成一条证据，记录来源、数据时点、单位口径和原始字段。互不依赖的取数会并发执行，每一步都写入检查点。",
+    "c6": "右侧的证据面板实时增加，成功、失败和缺失都会被记录，不会被静默跳过。",
+    "c7": "对话流里是动态生成的指标卡、红涨绿跌的日 K 线，以及估值和财务表格，都标注了证据编号和数据时点。",
+    "c8": "点击任意证据编号，可以查看来源、数据时点、单位口径、request id 和原始数据。",
+    "c9": "研究报告把结论分为事实、推断和不确定三层，每一条都带证据引用。",
+    "c10": "数值核验会把事实里的每个数字，拿回所引证据的原始字段逐个核对，核不到的会标为待核。",
+    "c11": "接口失败和数据缺失会如实列出，不会生成看似正常的结论。产品不做涨跌预测，也不给买卖建议。",
+    "c12": "研究要点写入长期记忆，同样需要人工批准。",
+    "c13": "观测页可以看到模型和工具的调用次数、token、成本、时延，以及停止规则的余量。",
+    "c14": "这是录制前预先跑的一次故障演示：数据源出错时，系统会重试、熔断，报告逐条写明哪些数据缺失，不编造任何数值。",
+    "c15": "界面支持浅色和深色终端两套主题，红涨绿跌。",
+    "end": "在线体验地址和源码地址见屏幕。谢谢观看。",
+}
+
 TITLE_CARD = """
 <div class="logo">X</div>
 <h1>投资 X Buddy</h1>
@@ -201,7 +241,7 @@ END_CARD = """
 """
 
 
-async def record(base: str, out: str) -> float:
+async def record(base: str, out: str, narr: dict[str, float] | None = None) -> tuple[float, list]:
     rec = Recorder(out)
     async with async_playwright() as p:
         browser = await p.chromium.launch()
@@ -210,6 +250,7 @@ async def record(base: str, out: str) -> float:
         await page.goto(base + "/")
         await page.wait_for_selector(".welcome")
         d = Director(page, rec)
+        d.narr = narr or {}
         await d.setup()
         cdp = await ctx.new_cdp_session(page)
 
@@ -220,11 +261,13 @@ async def record(base: str, out: str) -> float:
         cdp.on("Page.screencastFrame", on_frame)
         await d.card(TITLE_CARD)
         await cdp.send("Page.startScreencast", {"format": "jpeg", "quality": 92, "maxWidth": W, "maxHeight": H, "everyNthFrame": 1})
+        d.begin("title")
         await d.hold(3.2)
+        await d.gate()
         await d.card("")
 
         # ① 工作台概览
-        await d.caption("① 工作台", "给出一个研究目标：Agent 规划任务 → 调用真实金融数据工具 → 记录并核验证据 → 产出可回溯的研究报告")
+        await d.say("c1", "① 工作台", "给出一个研究目标：Agent 规划任务 → 调用真实金融数据工具 → 记录并核验证据 → 产出可回溯的研究报告")
         await d.point(page.locator(".welcome .steps"), 0.8)
         await d.hold(1.6)
         await d.point(page.locator(".sidebar .threads"), 0.6)
@@ -235,7 +278,7 @@ async def record(base: str, out: str) -> float:
         await d.hold(1.4)
 
         # ② 发起研究
-        await d.caption("② 发起研究", "把“计划确认”设为始终审批，再选择预置目标：贵州茅台行情、估值、财务，并与白酒板块对比")
+        await d.say("c2", "② 发起研究", "把“计划确认”设为始终审批，再选择预置目标：贵州茅台行情、估值、财务，并与白酒板块对比")
         await d.click(page.locator(".presets button", has_text="预算与审批"))
         sel = page.locator(".settings label", has_text="计划确认").locator("select")
         await d.point(sel, 0.5)
@@ -247,7 +290,7 @@ async def record(base: str, out: str) -> float:
         await d.click(page.locator(".composer button.primary"), 0.6)
 
         # ③ 计划与审批（规划阶段等待模型 → 快进）
-        await d.caption("③ 计划审批", "模型把目标拆成可验收的任务：每个任务写明要用的工具与验收标准")
+        await d.say("c3", "③ 计划审批", "模型把目标拆成可验收的任务：每个任务写明要用的工具与验收标准")
         rec.set_speed(4.0)
         await d.badge("×4 快进")
         await page.wait_for_selector(".approval:not(.decided) button.primary", timeout=180_000)
@@ -258,12 +301,12 @@ async def record(base: str, out: str) -> float:
         for i in range(min(n_tasks, 3)):
             await d.point(page.locator(".plan .task").nth(i), 0.45)
             await d.hold(0.9)
-        await d.caption("③ 计划审批", "关键决策由人确认：批准后才开始执行（拒绝则停止并输出部分报告）")
+        await d.say("c4", "③ 计划审批", "关键决策由人确认：批准后才开始执行（拒绝则停止并输出部分报告）")
         await d.scroll_into(".approval:not(.decided)", "center")
         await d.click(page.locator(".approval:not(.decided) button.primary"), 0.6)
 
         # ④ 执行（快进）
-        await d.caption("④ 执行", "每次工具调用都生成证据 E#：来源 · 数据时点 · 单位口径 · 原始字段；同轮取数并发执行，每一步写检查点")
+        await d.say("c5", "④ 执行", "每次工具调用都生成证据 E#：来源 · 数据时点 · 单位口径 · 原始字段；同轮取数并发执行，每一步写检查点")
         rec.set_speed(4.0)
         await d.badge("×4 快进")
         t_exec = time.monotonic()
@@ -275,7 +318,7 @@ async def record(base: str, out: str) -> float:
             if not switched and time.monotonic() - t_exec > 30:
                 switched = True
                 await d.click(page.locator(".tabs button").nth(1), 0.3)
-                await d.caption("④ 执行", "右侧证据面板实时增加：成功、失败、缺失都会记录，不会被静默跳过")
+                await d.say("c6", "④ 执行", "右侧证据面板实时增加：成功、失败、缺失都会记录，不会被静默跳过")
             if time.monotonic() - t_exec > 360:
                 raise TimeoutError("研究运行超时")
             await d.hold(0.25)
@@ -285,13 +328,13 @@ async def record(base: str, out: str) -> float:
         await d.click(page.locator(".tabs button").nth(0), 0.4)
 
         # ⑤ 动态 UI：K 线与指标
-        await d.caption("⑤ 动态 UI", "行情指标卡、日 K 线（红涨绿跌，MA5 / MA20）、估值与财务表格，均标注证据编号与数据时点")
+        await d.say("c7", "⑤ 动态 UI", "行情指标卡、日 K 线（红涨绿跌，MA5 / MA20）、估值与财务表格，均标注证据编号与数据时点")
         await d.scroll_into(".kline", "center")
         await d.point(page.locator(".kline").first, 0.7)
         await d.hold(2.6)
 
         # ⑥ 证据回溯
-        await d.caption("⑥ 证据回溯", "点击任意证据编号 [E#]，查看来源、数据时点、单位口径、request_id 与原始 JSON", "bottom")
+        await d.say("c8", "⑥ 证据回溯", "点击任意证据编号 [E#]，查看来源、数据时点、单位口径、request_id 与原始 JSON", "bottom")
         ev = page.locator("div:has(> .kline) > .block-title .evref").first
         await d.click(ev, 0.5)
         await page.wait_for_selector(".modal")
@@ -302,7 +345,7 @@ async def record(base: str, out: str) -> float:
         await d.click(page.locator(".modal button", has_text="关闭"), 0.5)
 
         # ⑦ 研究报告
-        await d.caption("⑦ 研究报告", "结论分为【事实】【推断】【不确定】三层，每条都带证据引用", "bottom")
+        await d.say("c9", "⑦ 研究报告", "结论分为【事实】【推断】【不确定】三层，每条都带证据引用", "bottom")
         await d.scroll_into(".msg .artifact", "center")
         await d.click(page.locator(".msg .artifact button.primary").last, 0.6)
         await page.wait_for_selector(".modal .md")
@@ -310,13 +353,13 @@ async def record(base: str, out: str) -> float:
         await d.hold(1.2)
         await d.scroll_el(".modal", 260, steps=4)
         await d.hold(2.2)
-        await d.caption("⑦ 研究报告", "数值核验：【事实】里的每个数字都回到所引证据的原始字段逐个核对，核不到的标“待核”", "bottom")
+        await d.say("c10", "⑦ 研究报告", "数值核验：【事实】里的每个数字都回到所引证据的原始字段逐个核对，核不到的标“待核”", "bottom")
         await d.page.evaluate("() => { const m = document.querySelector('.modal'); const c = [...m.querySelectorAll('.callout')].find(x => x.innerText.includes('数值核验')); if (c) c.scrollIntoView({behavior:'smooth', block:'center'}); }")
         await d.hold(1.0)
         if await page.locator(".modal .callout", has_text="数值核验").count():
             await d.point(page.locator(".modal .callout", has_text="数值核验").first, 0.5)
         await d.hold(2.2)
-        await d.caption("⑦ 研究报告", "接口失败、数据缺失如实列出，不生成“正常”结论；不做涨跌预测，不给买卖建议", "bottom")
+        await d.say("c11", "⑦ 研究报告", "接口失败、数据缺失如实列出，不生成“正常”结论；不做涨跌预测，不给买卖建议", "bottom")
         await d.page.evaluate("() => { const m = document.querySelector('.modal'); const h = [...m.querySelectorAll('h2')].find(x => x.innerText.includes('数据缺失')); if (h) h.scrollIntoView({behavior:'smooth', block:'start'}); }")
         await d.hold(3.0)
         await d.page.evaluate("() => { const m = document.querySelector('.modal'); const h = [...m.querySelectorAll('h2')].find(x => x.innerText.includes('免责声明')); if (h) h.scrollIntoView({behavior:'smooth', block:'center'}); }")
@@ -324,13 +367,13 @@ async def record(base: str, out: str) -> float:
         await d.click(page.locator(".modal button", has_text="关闭"), 0.5)
 
         # ⑧ 长期记忆审批 + 可观测性
-        await d.caption("⑧ 长期记忆", "研究要点写入长期记忆同样需要人工批准；记忆面板可查看、可删除")
+        await d.say("c12", "⑧ 长期记忆", "研究要点写入长期记忆同样需要人工批准；记忆面板可查看、可删除")
         await d.scroll_into(".approval:not(.decided)", "center")
         await d.hold(1.0)
         await d.click(page.locator(".approval:not(.decided) button.primary"), 0.6)
         await d.click(page.locator(".tabs button").nth(4), 0.6)
         await d.hold(2.0)
-        await d.caption("⑨ 可观测性", "观测页：模型与工具调用次数、token、成本、时延、停止规则余量与事件时间线")
+        await d.say("c13", "⑨ 可观测性", "观测页：模型与工具调用次数、token、成本、时延、停止规则余量与事件时间线")
         await d.click(page.locator(".tabs button").nth(3), 0.5)
         await d.hold(1.0)
         await d.point(page.locator(".right .panel .card").first, 0.5)
@@ -339,7 +382,7 @@ async def record(base: str, out: str) -> float:
         await d.hold(1.6)
 
         # ⑩ 故障降级（录制前预跑的线程）
-        await d.caption("⑩ 故障降级", "录制前预跑：注入扶摇数据源故障 → 重试、熔断 → 报告逐条写明哪些数据缺失，不编造任何数值")
+        await d.say("c14", "⑩ 故障降级", "录制前预跑：注入扶摇数据源故障 → 重试、熔断 → 报告逐条写明哪些数据缺失，不编造任何数值")
         await d.click(page.locator(".tabs button").nth(0), 0.4)
         await d.click(page.locator(".thread-item", has_text="招商银行"), 0.6)
         await page.wait_for_selector(".msg .artifact")
@@ -352,7 +395,7 @@ async def record(base: str, out: str) -> float:
         await d.hold(2.6)
 
         # ⑪ 深色终端主题
-        await d.caption("⑪ 主题", "浅色 / 深色终端两套主题，红涨绿跌")
+        await d.say("c15", "⑪ 主题", "浅色 / 深色终端两套主题，红涨绿跌")
         await d.click(page.locator(".thread-item", has_text="茅台"), 0.6)
         await page.wait_for_selector(".kline")
         await d.hold(0.6)
@@ -361,14 +404,55 @@ async def record(base: str, out: str) -> float:
         await d.hold(2.6)
         await d.click(page.locator(".appbar .theme-toggle"), 0.4)
         await d.hold(0.8)
+        await d.gate()
         await d.caption("", "")
 
         await d.card(END_CARD)
-        await d.hold(4.5)
+        d.begin("end")
+        await d.hold(max(4.5, d.narr.get("end", 0.0) + 0.8))
         await cdp.send("Page.stopScreencast")
         await browser.close()
     rec.close()
-    return rec.seconds
+    return rec.seconds, d.timeline
+
+
+def ffmpeg_duration(path: str) -> float:
+    out = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-i", path], capture_output=True, text=True, errors="ignore").stderr
+    m = __import__("re").search(r"Duration: (\d+):(\d+):([\d.]+)", out)
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else 0.0
+
+
+def synthesize(voice: str, rate: str, outdir: pathlib.Path) -> dict[str, tuple[str, float]]:
+    """用 edge-tts 把旁白稿合成为 mp3（按文本+音色缓存），返回 {键: (文件, 时长)}。"""
+    import hashlib
+
+    import edge_tts
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    clips: dict[str, tuple[str, float]] = {}
+
+    async def run():
+        for key, text in NARRATION.items():
+            h = hashlib.sha1(f"{voice}|{rate}|{text}".encode()).hexdigest()[:10]
+            f = outdir / f"{key}-{h}.mp3"
+            if not f.exists():
+                await edge_tts.Communicate(text, voice, rate=rate).save(str(f))
+            clips[key] = (str(f), ffmpeg_duration(str(f)))
+
+    asyncio.run(run())
+    return clips
+
+
+def mux(video: str, clips: dict[str, tuple[str, float]], timeline: list, out: str) -> None:
+    ins, filt, labels = ["-i", video], [], []
+    for i, (key, start) in enumerate([t for t in timeline if t[0] in clips], start=1):
+        ins += ["-i", clips[key][0]]
+        ms = int(start * 1000)
+        filt.append(f"[{i}:a]adelay={ms}|{ms},volume=1.0[a{i}]")
+        labels.append(f"[a{i}]")
+    filt.append("".join(labels) + f"amix=inputs={len(labels)}:normalize=0:dropout_transition=0[aout]")
+    subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", *ins, "-filter_complex", ";".join(filt),
+                    "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-t", f"{ffmpeg_duration(video):.3f}", "-movflags", "+faststart", out], check=True)
 
 
 def main() -> None:
@@ -376,10 +460,20 @@ def main() -> None:
     ap.add_argument("--base", default="http://127.0.0.1:8767")
     ap.add_argument("--out", default="xbuddy-demo.mp4")
     ap.add_argument("--skip-prep", action="store_true")
+    ap.add_argument("--voice", default="", help="加中文配音时的 edge-tts 音色，如 zh-CN-XiaoxiaoNeural；留空则无配音")
+    ap.add_argument("--rate", default="+0%", help="语速，如 +8%")
     a = ap.parse_args()
+    clips = synthesize(a.voice, a.rate, HERE / "tts") if a.voice else {}
+    if clips:
+        print("[tts] " + "，".join(f"{k} {d:.1f}s" for k, (_, d) in clips.items()))
     if not a.skip_prep:
         prep_fault_thread(a.base)
-    secs = asyncio.run(record(a.base, a.out))
+    silent = a.out if not clips else a.out + ".silent.mp4"
+    secs, timeline = asyncio.run(record(a.base, silent, {k: d for k, (_, d) in clips.items()}))
+    (pathlib.Path(a.out).with_suffix(".timeline.json")).write_text(json.dumps(timeline, ensure_ascii=False, indent=1), encoding="utf-8")
+    if clips:
+        mux(silent, clips, timeline, a.out)
+        pathlib.Path(silent).unlink(missing_ok=True)
     print(f"[done] {a.out}  时长约 {secs:.1f}s")
 
 
