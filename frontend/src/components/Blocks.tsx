@@ -39,13 +39,13 @@ export function PlanBlock({ b, tasks }: { b: Block; tasks?: Task[] }) {
 export function MetricsBlock({ b, onEvidence }: { b: Block; onEvidence: (l: string) => void }) {
   return (
     <div>
-      <div className="block-title"><span>{b.title}{b.timestamp ? ` · 时点 ${b.timestamp}` : ""}</span>{b.evidence && <a className="evref" onClick={() => onEvidence(b.evidence)}>{b.evidence}</a>}</div>
+      <div className="block-title"><span>{b.title}{b.timestamp ? <span className="ts">时点 {b.timestamp}</span> : null}</span>{b.evidence && <a className="evref" onClick={() => onEvidence(b.evidence)}>{b.evidence}</a>}</div>
       <div className="metrics">
         {(b.items || []).map((it: any, i: number) => (
           <div className={`metric ${it.trend || ""}`} key={i}>
             <div className="l">{it.label}</div>
             <div className="v">{it.value ?? "--"}</div>
-            {(it.sub || it.note) && <div className="s">{[it.sub, it.note].filter(Boolean).join(" · ")}</div>}
+            {(it.sub || it.note) && <div className="s">{it.sub ? <span className="chg">{it.sub}</span> : null}{it.sub && it.note ? " · " : ""}{it.note}</div>}
           </div>
         ))}
       </div>
@@ -53,14 +53,35 @@ export function MetricsBlock({ b, onEvidence }: { b: Block; onEvidence: (l: stri
   );
 }
 
+// 涨跌类列按正负着色（红涨绿跌），数值列右对齐、等宽数字
+const CHANGE_COL = /涨跌|涨幅|跌幅|变化|收益|change|pct/i;
+function asNumber(v: any): number {
+  if (typeof v === "number") return v;
+  if (typeof v === "string" && /^[+-]?\d+(\.\d+)?%?$/.test(v.trim())) return parseFloat(v);
+  return NaN;
+}
+const GROWTH_ROW = /同比|增长率|涨跌幅/; // 只认“变化类”行，收益率 / ROE 等水平值不着色
+function cellClass(col: string, v: any, rowLabel = ""): string {
+  const n = asNumber(v);
+  if (Number.isNaN(n)) return "";
+  if (!CHANGE_COL.test(col) && !GROWTH_ROW.test(rowLabel)) return "n";
+  return n > 0 ? "n up" : n < 0 ? "n down" : "n";
+}
+const isBlank = (v: any) => v == null || v === "--" || v === "";
+
 export function TableBlock({ b, onEvidence }: { b: Block; onEvidence: (l: string) => void }) {
+  const cols: string[] = b.columns || [];
+  const rows: any[][] = b.rows || [];
+  const numericCol = cols.map((_, j) => rows.length > 0 && rows.every((r) => isBlank(r[j]) || !Number.isNaN(asNumber(r[j]))) && rows.some((r) => !Number.isNaN(asNumber(r[j]))));
+  // 两列“指标 / 值”表：按行名判断是否为增长类指标（如“净利润同比%”）
+  const kvTable = cols.length === 2;
   return (
     <div>
-      <div className="block-title"><span>{b.title}{b.timestamp ? ` · 时点 ${b.timestamp}` : ""}</span>{b.evidence && <a className="evref" onClick={() => onEvidence(b.evidence)}>{b.evidence}</a>}</div>
+      <div className="block-title"><span>{b.title}{b.timestamp ? <span className="ts">时点 {b.timestamp}</span> : null}</span>{b.evidence && <a className="evref" onClick={() => onEvidence(b.evidence)}>{b.evidence}</a>}</div>
       <div className="table-wrap">
         <table>
-          <thead><tr>{(b.columns || []).map((c: string, i: number) => <th key={i}>{c}</th>)}</tr></thead>
-          <tbody>{(b.rows || []).map((r: any[], i: number) => <tr key={i}>{r.map((c, j) => <td key={j}>{c === null || c === undefined ? "--" : String(c)}</td>)}</tr>)}</tbody>
+          <thead><tr>{cols.map((c, i) => <th key={i} className={numericCol[i] ? "n" : ""}>{c}</th>)}</tr></thead>
+          <tbody>{rows.map((r, i) => <tr key={i}>{r.map((c, j) => <td key={j} className={numericCol[j] ? cellClass(cols[j] || "", c, kvTable && j === 1 ? String(r[0] ?? "") : "") || "n" : ""}>{c === null || c === undefined ? "--" : String(c)}</td>)}</tr>)}</tbody>
         </table>
       </div>
     </div>
@@ -153,7 +174,7 @@ export default function BlockView({ b, tasks, approvals, onEvidence, onOpenArtif
     case "kline":
       return (
         <div>
-          <div className="block-title"><span>{b.title}{b.timestamp ? ` · 时点 ${b.timestamp}` : ""}</span>{b.evidence && <a className="evref" onClick={() => onEvidence(b.evidence)}>{b.evidence}</a>}</div>
+          <div className="block-title"><span>{b.title}{b.timestamp ? <span className="ts">时点 {b.timestamp}</span> : null}</span>{b.evidence && <a className="evref" onClick={() => onEvidence(b.evidence)}>{b.evidence}</a>}</div>
           <KlineChart series={b.series || []} />
           {b.unit && <div className="hint">{b.unit}</div>}
         </div>

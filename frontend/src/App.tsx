@@ -3,6 +3,7 @@ import { api, fmtDur } from "./api";
 import BlockView from "./components/Blocks";
 import { ArtifactModal, ArtifactsPanel, EvidenceModal, EvidencePanel, MemoryPanel, TasksPanel, TracePanel } from "./components/Panels";
 import { useThreadStream } from "./hooks/useThreadStream";
+import { applyTheme, useTheme } from "./theme";
 import type { Config, Evidence, Message, Run, ThreadRow, XEvent } from "./types";
 
 const PRESETS = [
@@ -34,6 +35,7 @@ export default function App() {
   const sinceRef = useRef(0);
   const runIdRef = useRef<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const theme = useTheme();
 
   const loadThreads = useCallback(() => api.threads().then((r) => setThreads(r.threads)).catch(() => {}), []);
   useEffect(() => {
@@ -147,10 +149,30 @@ export default function App() {
   const u = run?.usage;
 
   return (
-    <div className="app">
+    <div className="shell">
+      <header className="appbar">
+        <div className="brand">
+          <div className="logo">X</div>
+          <h1>投资 X Buddy</h1>
+          <span className="divider" />
+          <span className="sub">投研 Agent 工作台</span>
+        </div>
+        <div className="spacer" />
+        {config && (
+          <div className="status">
+            <span><span className={`dot ${config.llm.available ? "ok" : "warn"}`} />模型 {config.llm.available ? config.llm.primary?.model : "未配置（模板模式）"}{config.llm.fallback ? " +备用" : ""}</span>
+            <span><span className={`dot ${config.fuyao.mode === "live" ? "ok" : "warn"}`} />扶摇 {config.fuyao.mode === "live" ? "实时数据" : "演示数据"}</span>
+            <span><span className={`dot ${config.ifind.ok ? "ok" : config.ifind.configured ? "err" : ""}`} />iFinD {config.ifind.ok ? `${config.ifind.count} 个工具` : config.ifind.configured ? "连接失败" : "未配置"}</span>
+            <span>工具 {config.tools.length}</span>
+            <span><span className={`dot ${sse === "open" ? "ok" : sse === "error" ? "err" : ""}`} />实时推送 {sse === "open" ? "已连接" : sse === "error" ? "重连中" : "未连接"}</span>
+          </div>
+        )}
+        <button className="theme-toggle" onClick={() => applyTheme(theme === "dark" ? "light" : "dark")} title="切换浅色 / 深色终端主题">{theme === "dark" ? "☀ 浅色" : "☾ 终端"}</button>
+      </header>
+      <div className="app">
       <aside className="sidebar">
-        <div className="brand"><div className="logo">X</div><div><h1>投资 X Buddy</h1><small>投研 Agent 工作台 · Harness Demo</small></div></div>
-        <div style={{ padding: "8px 8px 0" }}><button className="primary" style={{ width: "100%" }} onClick={newThread}>＋ 新研究线程</button></div>
+        <div className="new"><button className="primary" onClick={newThread}>＋ 新研究</button></div>
+        <div className="side-title">研究线程</div>
         <div className="threads">
           {threads.map((t) => (
             <div className={`thread-item ${t.id === threadId ? "active" : ""}`} key={t.id} onClick={() => openThread(t.id)}>
@@ -160,14 +182,10 @@ export default function App() {
           ))}
           {!threads.length && <div className="empty">还没有线程。输入研究目标开始。</div>}
         </div>
-        {config && (
-          <div className="caps">
-            <div><span className={`dot ${config.llm.available ? "ok" : "warn"}`} />模型：{config.llm.available ? `${config.llm.primary?.name}/${config.llm.primary?.model}` : "未配置 → 模板模式"}{config.llm.fallback ? ` (+备用 ${config.llm.fallback.model})` : ""}</div>
-            <div><span className={`dot ${config.fuyao.mode === "live" ? "ok" : "warn"}`} />扶摇：{config.fuyao.mode === "live" ? "真实接口" : "演示数据(fixture)"}</div>
-            <div><span className={`dot ${config.ifind.ok ? "ok" : config.ifind.configured ? "err" : ""}`} />iFinD MCP：{config.ifind.ok ? `${config.ifind.count} 个工具` : config.ifind.configured ? "连接失败" : "未配置"}</div>
-            <div>工具 {config.tools.length} 个 · SSE {sse}</div>
-          </div>
-        )}
+        <div className="caps">
+          <div>红涨绿跌 · 时点与口径见证据</div>
+          <div>不预测涨跌，不给买卖建议</div>
+        </div>
       </aside>
 
       <main className="main">
@@ -191,9 +209,17 @@ export default function App() {
 
         <div className="messages" ref={listRef}>
           {!threadId && (
-            <div className="empty">
-              <p>👋 这是一个面向投资研究者的 Agent 工作台。给出研究目标后，系统会：规划任务 → 调用扶摇 / iFinD 金融工具 → 记录每条证据（来源 / 时点 / 单位）→ 压缩上下文 → 在需要时请求你确认 → 产出可回溯的研究报告。</p>
-              <p className="hint">不输出涨跌预测与买卖建议；事实 / 推断 / 不确定分层标注。</p>
+            <div className="welcome">
+              <h2>给出一个研究目标，把研究过程做扎实</h2>
+              <p>系统会规划任务、调用扶摇 / iFinD 金融数据工具、记录每条证据的来源 / 时点 / 单位，在需要时请你确认，最后产出每条结论都能回到原始字段的研究报告。</p>
+              <div className="steps">
+                <div><b>01 规划</b>拆解任务与工具</div>
+                <div><b>02 取数</b>行情 / 估值 / 财务 / 板块</div>
+                <div><b>03 核验</b>证据 E# 与数值核验</div>
+                <div><b>04 确认</b>计划 / 写操作 / 预算</div>
+                <div><b>05 报告</b>事实 · 推断 · 不确定</div>
+              </div>
+              <p className="hint">不输出涨跌预测、目标价与买卖建议。可以从下方预置目标开始。</p>
             </div>
           )}
           {messages.map((m) => (
@@ -246,6 +272,7 @@ export default function App() {
         {tab === "trace" && <TracePanel run={run} events={events} />}
         {tab === "memory" && <MemoryPanel />}
       </aside>
+      </div>
 
       <EvidenceModal ev={evOpen} onClose={() => setEvOpen(null)} />
       <ArtifactModal id={artOpen} onClose={() => setArtOpen(null)} onEvidence={(l) => { setArtOpen(null); openEvidenceByLabel(l); }} />
