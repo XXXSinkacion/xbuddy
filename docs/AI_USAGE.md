@@ -47,7 +47,7 @@
 - [ ] 运行中重启后端进程，确认 run 变为 `interrupted`，点击「从检查点恢复」后完成且证据编号连续
 - [x] 计划审批卡片：真实运行中计划含 L2 工具时自动触发，UI 批准后继续；L2 工具 `add_to_watchlist` 审批卡片在 UI 拒绝后任务继续、记忆无新增；拒绝计划 → 部分报告由 `test_approvals_and_stop.py` 覆盖，用户停止 → 部分报告在 live 运行中验证
 - [x] 检查仓库不含任何密钥（`git grep -i "sk-"` 无结果、`.env` 被 `.gitignore` 排除）
-- [ ] 部署到公网并把 URL 写入 README
+- [x] 部署到公网并把 URL 写入 README（Render 免费实例，2026-10-26，线上真实任务验收通过）
 
 ## 5. 关于 AI 产出的边界声明
 

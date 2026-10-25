@@ -72,3 +72,4 @@ python scripts/live_probe.py          # 加 --raw 打印原始 JSON
 | 上下文预算 2500 tokens | 事件 `context.compressed` 4 次（含 1 次折叠 11 条消息、节省 2196 tokens），运行完成，报告 0 违规 |
 | 运行中点停止 | 状态 `stopped`，产出标注“运行未完成：用户请求停止”的部分报告 |
 | 发现并修复 | 熔断连坐、报表字段名、指数单位、非交易日涨停池、演示记忆污染、Linter 否定语境误删（见 AI_USAGE.md 第 3 节 9–14） |
+| 线上验收（2026-10-26，Render 免费实例 <https://xbuddy-c5m7.onrender.com>） | `/api/health` 返回 ok、llm=true、fuyao_mode=live、25 工具；真实任务「茅台近 90 天行情 + 最新财务指标」53s 完成，14 次模型调用、19 次工具调用、约 0.013 美元，6 任务 done，19 条证据，报告约 6.6k 字带 `[E#]`；唯一工具错误为 2026-3 财务指标 5003（预期） |

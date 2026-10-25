@@ -3,7 +3,7 @@
 > 题目 13｜给出一个研究目标，系统规划任务 → 调用金融工具（扶摇 / iFinD MCP）→ 管理上下文与长期记忆 → 在需要时请求确认 → 产出每条结论都能回溯到原始字段的研究报告。
 > 同时展示 Agent Harness 的运行机制：能力注册、计划执行、上下文压缩、记忆、检查点与恢复、权限审批、停止规则、成本/时延预算、可观测性、降级与恢复。
 
-- **在线体验**：`<部署后填写 URL>`（部署方式见下文「部署」）
+- **在线体验**：<https://xbuddy-c5m7.onrender.com>（Render 免费实例，15 分钟无访问会休眠，首次打开请等待数十秒冷启动；部署方式见下文「部署」）
 - **架构设计**：[docs/DESIGN.md](docs/DESIGN.md)
 - **AI 使用与验证记录**：[docs/AI_USAGE.md](docs/AI_USAGE.md)
 - **测试说明**：[docs/TESTING.md](docs/TESTING.md)
@@ -147,7 +147,15 @@ Dockerfile docker-compose.yml scripts/
 ## 10. 部署
 
 任何支持 Docker 的平台均可：`docker build -t xbuddy . && docker run -p 8000:8000 --env-file .env -v xbuddy-data:/data xbuddy`。
-Zeabur / Railway / Render 选择「Dockerfile 部署」，在平台环境变量里填入 `.env` 中的键值（勿提交 `.env`），持久化 `/data` 目录。
+Railway / Render / 自有服务器选择「Dockerfile 部署」，在平台环境变量里填入 `.env` 中的键值（勿提交 `.env`），持久化 `/data` 目录。
+
+### 10.1 在线演示的部署方式（Render 免费版 + 仓库内 `render.yaml` 蓝图）
+
+1. Render 控制台 New → **Blueprint**，选择本仓库，Render 会读取 `render.yaml`：Docker 构建、健康检查 `/api/health`、非密钥变量已预填。
+2. 两个密钥 `FUYAO_API_KEY`、`LLM_API_KEY` 在蓝图中标记为 `sync: false`，需在控制台手工填写，不进入仓库。
+3. 免费版约束（已知、不影响功能演示）：
+   - 15 分钟无访问会休眠，再次访问有数十秒冷启动，首次打开请稍候；
+   - 没有持久磁盘，服务重建后 `/data`（SQLite 线程 / 检查点 / 记忆）会清空；需要持久化时挂载磁盘到 `/data` 即可（`DATA_DIR=/data`）。
 
 ## 11. 免责声明
 
